@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fancy-regex = "0.19.0"
+bitvec = "1.1.1"
+compact_str = "0.10.0"
+rand = "0.10.2"
+regex = "1.13.1"
 serde_json = "1.0.151"
 thiserror = "2.0.20"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "brrrrt"
+harness = false
