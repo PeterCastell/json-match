@@ -1,19 +1,39 @@
-// use std::hint::black_box;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use json_regex::testing::{generate_test_json, test_fields};
+use json_regex::{MatchMachine, MatchSet};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use std::hint::black_box;
 
-// use criterion::{Criterion, criterion_group, criterion_main};
-// use json_regex::*;
-// use rand::SeedableRng;
+fn bench_match(c: &mut Criterion) {
+    let fields = test_fields();
+    let machine = MatchMachine::compile(
+        std::iter::once(MatchSet {
+            field_matches: &fields,
+        }),
+        |_| {},
+    )
+    .unwrap();
+    let mut state = machine.allocate_state();
 
-// criterion_group!(benches, criterion_benchmark);
-// criterion_main!(benches);
-// fn criterion_benchmark(c: &mut Criterion) {
-//     rand::rngs::StdRng::seed_from_u64(0);
-//     c.bench_function("speed_test", |b|{
-//         let regex = fancy_regex::Regex::new(&create_regex_pattern_string(testing::TEST_STRUCTURE).unwrap()).unwrap();
-//         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
-//         let test_str = &testing::generate_test_json(testing::TEST_STRUCTURE, 1.0, 1.0, &mut rng);
-//         b.iter(||{
-//             black_box(regex.captures(black_box(test_str))).unwrap();
-//         });
-//     });
-// }
+    let mut group = c.benchmark_group("match_string");
+    for bloat in [0.0, 2.0, 8.0, 16.0, 32.0, 64.0] {
+        let mut rng = StdRng::seed_from_u64(0xB00B5);
+        let json = generate_test_json(&fields, 1.0, bloat, &mut rng);
+        group.throughput(Throughput::Bytes(json.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("bloat_{bloat}")),
+            &json,
+            |b, json| {
+                b.iter(|| {
+                    machine.match_string(black_box(json), &mut state).unwrap();
+                    black_box(&mut state);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_match);
+criterion_main!(benches);
