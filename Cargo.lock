@@ -330,7 +330,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "json_regex"
+name = "json-match"
 version = "0.1.0"
 dependencies = [
  "bitvec",
