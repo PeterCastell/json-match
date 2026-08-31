@@ -731,20 +731,31 @@ impl Matcher<'_, '_> {
         'value: loop {
             // A value is expected at i.
             match self.peek(i)? {
-                byte @ (b'{' | b'[') => {
+                b'{' => {
                     if depth == limit {
                         return Err(MatchError::DepthLimitExceeded { pos: i });
                     }
-                    let is_object = byte == b'{';
-                    state.bracket_stack.set(depth, is_object);
+                    state.bracket_stack.set(depth, true);
                     depth += 1;
                     i = self.skip_ws(i + 1);
-                    if self.peek(i)? == (if is_object { b'}' } else { b']' }) {
+                    if self.peek(i)? == b'}' {
                         i += 1;
                         depth -= 1;
-                    } else if is_object {
+                    } else {
                         i = self.validate_key_colon(i)?;
                         continue 'value;
+                    }
+                }
+                b'[' => {
+                    if depth == limit {
+                        return Err(MatchError::DepthLimitExceeded { pos: i });
+                    }
+                    state.bracket_stack.set(depth, false);
+                    depth += 1;
+                    i = self.skip_ws(i + 1);
+                    if self.peek(i)? == b']' {
+                        i += 1;
+                        depth -= 1;
                     } else {
                         continue 'value;
                     }
