@@ -13,7 +13,7 @@ pub struct MatchSet<'a> {
 
 pub struct FieldMatch<'a> {
     pub path: &'a [PathSegment<'a>],
-    pub r#type: FieldType<'a>,
+    pub r#type: FieldType,
     pub predicate: Option<Regex>,
     pub capture: bool,
 }
@@ -29,7 +29,8 @@ pub enum PathSegment<'a> {
     AnyIndex,
 }
 
-pub enum FieldType<'a> {
+#[derive(Clone, Debug)]
+pub enum FieldType {
     Object,
     Array,
     String,
@@ -37,8 +38,8 @@ pub enum FieldType<'a> {
     Bool,
     Null,
     /// Raw byte-for-byte comparison against the value's text, whitespace-sensitive.
-    /// Example: `Literal("[1,2,3]")`
-    Literal(&'a str),
+    /// Example: `Literal("[1,2,3]".into())`
+    Literal(CompactString),
     /// Match any value, type is returned through CaptureValue.
     Any,
 }
@@ -97,23 +98,11 @@ pub enum MatchError {
 }
 
 #[derive(Clone)]
-enum TypeCheck {
-    Object,
-    Array,
-    String,
-    Number,
-    Bool,
-    Null,
-    Literal(Box<str>),
-    Any,
-}
-
-#[derive(Clone)]
 struct Action {
     set_index: u32,
     /// Global field id across all sets; indexes MachineState.satisfied.
     field_bit: u32,
-    type_check: TypeCheck,
+    type_check: FieldType,
     predicate: Option<Regex>,
     /// Index into MachineState.capture_locs; u32::MAX when predicate is None.
     predicate_loc: u32,
@@ -361,21 +350,10 @@ impl MatchMachine {
                     next_predicate_loc += 1;
                 }
 
-                let type_check = match &field.r#type {
-                    FieldType::Object => TypeCheck::Object,
-                    FieldType::Array => TypeCheck::Array,
-                    FieldType::String => TypeCheck::String,
-                    FieldType::Number => TypeCheck::Number,
-                    FieldType::Bool => TypeCheck::Bool,
-                    FieldType::Null => TypeCheck::Null,
-                    FieldType::Literal(literal) => TypeCheck::Literal((*literal).into()),
-                    FieldType::Any => TypeCheck::Any,
-                };
-
                 nodes[node as usize].actions.push(Action {
                     set_index: set_index as u32,
                     field_bit: next_field_bit,
-                    type_check,
+                    type_check: field.r#type.clone(),
                     predicate: field.predicate.clone(),
                     predicate_loc,
                     predicate_groups: predicate_groups.into_boxed_slice(),
@@ -705,14 +683,14 @@ impl Matcher<'_, '_> {
                 continue;
             }
             let type_ok = match &action.type_check {
-                TypeCheck::Object => first == b'{',
-                TypeCheck::Array => first == b'[',
-                TypeCheck::String => first == b'"',
-                TypeCheck::Number => matches!(first, b'-' | b'0'..=b'9'),
-                TypeCheck::Bool => matches!(first, b't' | b'f'),
-                TypeCheck::Null => first == b'n',
-                TypeCheck::Literal(literal) => literal.as_bytes() == &self.bytes[start..end],
-                TypeCheck::Any => true,
+                FieldType::Object => first == b'{',
+                FieldType::Array => first == b'[',
+                FieldType::String => first == b'"',
+                FieldType::Number => matches!(first, b'-' | b'0'..=b'9'),
+                FieldType::Bool => matches!(first, b't' | b'f'),
+                FieldType::Null => first == b'n',
+                FieldType::Literal(literal) => literal.as_bytes() == &self.bytes[start..end],
+                FieldType::Any => true,
             };
             if !type_ok {
                 continue;

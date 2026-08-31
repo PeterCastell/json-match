@@ -16,7 +16,7 @@ struct GenNode<'a> {
     key_children: Vec<(&'a str, usize)>,
     index_children: Vec<(u32, usize)>,
     any_index_child: Option<usize>,
-    terminals: Vec<&'a FieldType<'a>>,
+    terminals: Vec<&'a FieldType>,
 }
 
 fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &PathSegment<'a>) -> usize {
@@ -189,7 +189,7 @@ impl Emitter<'_, '_, '_> {
         format!("[{}]", elements.join(","))
     }
 
-    fn terminal(&mut self, ty: &FieldType<'_>) -> String {
+    fn terminal(&mut self, ty: &FieldType) -> String {
         match ty {
             FieldType::String => format!("{:?}", rand_name(self.rng)),
             FieldType::Number => noise_number(self.rng),
@@ -359,7 +359,7 @@ mod tests {
 
     fn field<'a>(
         path: &'a [PathSegment<'a>],
-        r#type: FieldType<'a>,
+        r#type: FieldType,
         predicate: Option<&str>,
         capture: bool,
     ) -> FieldMatch<'a> {
@@ -437,7 +437,7 @@ mod tests {
     fn literal_and_any() {
         let input = r#"{"lit":[1,2,3],"any":{"deep":1}}"#;
         let fields = [
-            field(&[Key("lit")], FieldType::Literal("[1,2,3]"), None, true),
+            field(&[Key("lit")], FieldType::Literal("[1,2,3]".into()), None, true),
             field(&[Key("any")], FieldType::Any, None, true),
         ];
         let (machine, captures) = compile(&[&fields]);
@@ -903,10 +903,7 @@ mod tests {
                         assert!(matches!(capture, CaptureValue::Number(_)));
                     }
                     (ty, value) => {
-                        panic!(
-                            "unhandled oracle case: {ty:?} vs {value:?}",
-                            ty = std::mem::discriminant(ty)
-                        );
+                        panic!("unhandled oracle case: {ty:?} vs {value:?}");
                     }
                 }
             }
