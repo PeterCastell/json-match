@@ -761,9 +761,9 @@ impl Matcher<'_, '_> {
                     }
                 }
                 b'"' => i = self.validate_string(i)?.0,
-                b't' => i = self.expect_keyword(i, b"true")?,
-                b'f' => i = self.expect_keyword(i, b"false")?,
-                b'n' => i = self.expect_keyword(i, b"null")?,
+                b't' => i = self.expect_keyword_suffix(i + 1, b"rue")?,
+                b'f' => i = self.expect_keyword_suffix(i + 1, b"alse")?,
+                b'n' => i = self.expect_keyword_suffix(i + 1, b"ull")?,
                 b'-' | b'0'..=b'9' => i = self.validate_number(i)?,
                 byte => return Err(MatchError::UnexpectedByte { pos: i, byte }),
             }
@@ -813,7 +813,7 @@ impl Matcher<'_, '_> {
     }
 
     #[inline]
-    fn expect_keyword(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
+    fn expect_keyword_suffix(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
         let end = (pos as usize) + keyword.len();
         let bytes = self
             .bytes
