@@ -11,10 +11,12 @@ use soa_rs::{Soa, Soars};
 #[cfg(any(test, feature = "benchmarking"))]
 pub mod testing;
 
+#[derive(Debug, Clone, Copy)]
 pub struct Pattern<'a> {
-    pub field_matches: &'a [FieldPattern<'a>],
+    pub fields: &'a [FieldPattern<'a>],
 }
 
+#[derive(Debug, Clone)]
 pub struct FieldPattern<'a> {
     pub path: &'a [PathSegment],
     pub r#type: FieldType,
@@ -27,7 +29,7 @@ pub struct FieldPattern<'a> {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum PathSegment {
     Key(CompactString),
     /// Fixed array index.
@@ -39,7 +41,7 @@ pub enum PathSegment {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum FieldType {
     Object,
     Array,
@@ -54,7 +56,7 @@ pub enum FieldType {
     Any,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum CaptureValue {
     NotCaptured,
     PredicateCapture(UnescapedString),
@@ -69,7 +71,7 @@ pub enum CaptureValue {
     Null,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum UnescapedString {
     /// The value contained no escape sequences; the range indexes the original input.
     Borrowed(Range<u32>),
@@ -389,9 +391,9 @@ impl MatchMachine {
         let mut next_predicate_loc: u32 = 0;
 
         for (set_index, set) in match_sets.enumerate() {
-            set_required_counts.push(set.field_matches.len() as u32);
+            set_required_counts.push(set.fields.len() as u32);
             let mut next_set_capture_index: u32 = 0;
-            for (field_index, field) in set.field_matches.iter().enumerate() {
+            for (field_index, field) in set.fields.iter().enumerate() {
                 let mut node: NodeId = NodeId(0);
                 for segment in field.path {
                     node = get_or_create_child(&mut nodes, node, segment);

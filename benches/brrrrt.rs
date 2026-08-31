@@ -7,13 +7,8 @@ use std::hint::black_box;
 
 fn bench_match(c: &mut Criterion) {
     let fields = test_fields();
-    let machine = MatchMachine::compile(
-        std::iter::once(Pattern {
-            field_matches: &fields,
-        }),
-        |_| {},
-    )
-    .unwrap();
+    let machine =
+        MatchMachine::compile(std::iter::once(Pattern { fields: &fields }), |_| {}).unwrap();
     let mut state = machine.allocate_state();
     // High-bloat noise chains nest deeper than the default limit of 128.
     state.set_depth_limit(2048);

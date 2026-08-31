@@ -337,6 +337,8 @@ pub fn test_fields() -> Vec<FieldPattern<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use crate::{
         CaptureValue, DEFAULT_DEPTH_LIMIT, FieldPattern, FieldType, MachineState, MatchError,
         MatchMachine, PathSegment, Pattern, UnescapedString, range_u32_to_usize,
@@ -348,21 +350,16 @@ mod tests {
 
     fn compile(sets: &[&[FieldPattern<'_>]]) -> (MatchMachine, CaptureIndices) {
         let mut captures = std::collections::HashMap::new();
-        let machine = MatchMachine::compile(
-            sets.iter().map(|fields| Pattern {
-                field_matches: fields,
-            }),
-            |args| {
-                captures.insert(
-                    (
-                        args.match_set_index,
-                        args.field_index,
-                        args.predicate_capture_name.map(str::to_owned),
-                    ),
-                    args.capture_index_in_machine,
-                );
-            },
-        )
+        let machine = MatchMachine::compile(sets.iter().map(|fields| Pattern { fields }), |args| {
+            captures.insert(
+                (
+                    args.match_set_index,
+                    args.field_index,
+                    args.predicate_capture_name.map(str::to_owned),
+                ),
+                args.capture_index_in_machine,
+            );
+        })
         .unwrap();
         (machine, captures)
     }
@@ -402,7 +399,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"x":1,"a":{"y":[3],"b":true},"z":null}"#).unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Bool(true)
         );
@@ -444,15 +441,15 @@ mod tests {
             CaptureValue::String(s) => assert_eq!(s.resolve(input), "hi"),
             other => panic!("expected String, got {other:?}"),
         }
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 3, None)]),
             CaptureValue::Number(-1250.0)
         );
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 4, None)]),
             CaptureValue::Bool(false)
         );
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 5, None)]),
             CaptureValue::Null
         );
@@ -518,7 +515,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a\nb":7}"#).unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Number(7.0)
         );
@@ -654,7 +651,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a":[10,42,99]}"#).unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Number(42.0)
         );
@@ -696,7 +693,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a":[1,"s",{"other":0},{"id":5}]}"#).unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Number(5.0)
         );
@@ -713,7 +710,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a":[["x"],[null,7]]}"#).unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Number(7.0)
         );
@@ -772,7 +769,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, "[1, 2]").unwrap();
         assert!(state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::Number(2.0)
         );
@@ -977,7 +974,7 @@ mod tests {
         assert!(state.result.did_match(0));
         machine.match_string(r#"{"b":1}"#, &mut state).unwrap();
         assert!(!state.result.did_match(0));
-        assert_eq!(
+        assert_matches!(
             *state.result.capture(captures[&(0, 0, None)]),
             CaptureValue::NotCaptured
         );
@@ -998,15 +995,7 @@ mod tests {
         let set1 = [field(vec![key("d")], FieldType::Number, None, true)];
         let mut seen: Vec<(u32, u32, Option<String>, u32, u32)> = Vec::new();
         MatchMachine::compile(
-            [
-                Pattern {
-                    field_matches: &set0,
-                },
-                Pattern {
-                    field_matches: &set1,
-                },
-            ]
-            .into_iter(),
+            [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
             |args| {
                 seen.push((
                     args.match_set_index,
@@ -1068,7 +1057,7 @@ mod tests {
                         other => panic!("expected String, got {other:?}"),
                     },
                     (FieldType::Bool, Some(expected)) => {
-                        assert_eq!(*capture, CaptureValue::Bool(expected.as_bool().unwrap()));
+                        assert_matches!(*capture, CaptureValue::Bool(b) if b == expected.as_bool().unwrap());
                     }
                     (FieldType::Object, Some(expected)) => match capture {
                         CaptureValue::Object(range) => {
