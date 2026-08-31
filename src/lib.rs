@@ -1,18 +1,21 @@
 #![deny(unused_must_use)]
+#![forbid(unsafe_code)]
+
+use std::range::Range;
 
 use bitvec::{bitbox, boxed::BitBox, order::Lsb0};
 use compact_str::CompactString;
 use regex::{CaptureLocations, Regex};
-use std::range::Range;
+use soa_rs::{Soa, Soars};
 
+#[cfg(any(test, feature = "benchmarking"))]
 pub mod testing;
 
 pub struct Pattern<'a> {
-    pub field_matches: &'a [FieldMatch<'a>],
+    pub field_matches: &'a [FieldPattern<'a>],
 }
 
-
-pub struct FieldMatch<'a> {
+pub struct FieldPattern<'a> {
     pub path: &'a [PathSegment],
     pub r#type: FieldType,
     /// Regex the value must satisfy for the field to count as present. Runs
@@ -23,19 +26,19 @@ pub struct FieldMatch<'a> {
     pub capture: bool,
 }
 
-#[cfg_attr(feature="serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub enum PathSegment {
     Key(CompactString),
     /// Fixed array index.
-    Index(u32),
+    Index(u16),
     /// First array element whose continuation satisfies this field.
     /// Independent per field: two fields sharing an AnyIndex prefix may be
     /// satisfied by different elements.
     AnyIndex,
 }
 
-#[cfg_attr(feature="serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub enum FieldType {
     Object,
@@ -146,13 +149,29 @@ struct Action {
     value_capture: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+struct NodeId(u32);
+
+impl NodeId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Soars, soa_rs::SoaClone)]
+struct IndexChild {
+    index: u16,
+    child: NodeId,
+}
+
 struct Node {
-    key_children: Box<[(CompactString, u32)]>,
+    key_children: Box<[(CompactString, NodeId)]>,
     /// Sorted by index. When a node also has a wildcard child, each fixed-index
     /// subtree already contains a merged copy of the wildcard subtree, so every
     /// array element resolves to at most one node.
-    index_children: Box<[(u32, u32)]>,
-    any_index_child: Option<u32>,
+    index_children: Soa<IndexChild>,
+    any_index_child: Option<NodeId>,
     actions: Range<u32>,
 }
 
@@ -215,51 +234,57 @@ impl MachineState {
 
 #[derive(Default)]
 struct NodeBuild {
-    key_children: Vec<(CompactString, u32)>,
-    index_children: Vec<(u32, u32)>,
-    any_index_child: Option<u32>,
+    key_children: Vec<(CompactString, NodeId)>,
+    index_children: Soa<IndexChild>,
+    any_index_child: Option<NodeId>,
     actions: Vec<Action>,
 }
 
-fn push_node(nodes: &mut Vec<NodeBuild>) -> u32 {
+fn push_node(nodes: &mut Vec<NodeBuild>) -> NodeId {
     let index = nodes.len() as u32;
     nodes.push(NodeBuild::default());
-    index
+    NodeId(index)
 }
 
-fn get_or_create_child(nodes: &mut Vec<NodeBuild>, parent: u32, segment: &PathSegment) -> u32 {
-    match segment {
-        PathSegment::Key(key) => {
-            let existing = nodes[parent as usize]
+fn get_or_create_child(
+    nodes: &mut Vec<NodeBuild>,
+    parent: NodeId,
+    segment: &PathSegment,
+) -> NodeId {
+    match *segment {
+        PathSegment::Key(ref key) => {
+            let existing = nodes[parent.index()]
                 .key_children
                 .iter()
                 .find(|(k, _)| k == key)
                 .map(|&(_, child)| child);
             existing.unwrap_or_else(|| {
                 let child = push_node(nodes);
-                nodes[parent as usize]
+                nodes[parent.index()]
                     .key_children
                     .push((key.clone(), child));
                 child
             })
         }
         PathSegment::Index(index) => {
-            let existing = nodes[parent as usize]
+            let existing = nodes[parent.index()]
                 .index_children
                 .iter()
-                .find(|&&(i, _)| i == *index)
-                .map(|&(_, child)| child);
+                .find(|&IndexChildRef { index: &i, .. }| i == index)
+                .map(|IndexChildRef { child, .. }| *child);
             existing.unwrap_or_else(|| {
                 let child = push_node(nodes);
-                nodes[parent as usize].index_children.push((*index, child));
+                nodes[parent.index()]
+                    .index_children
+                    .push(IndexChild { index, child });
                 child
             })
         }
-        PathSegment::AnyIndex => match nodes[parent as usize].any_index_child {
+        PathSegment::AnyIndex => match nodes[parent.index()].any_index_child {
             Some(child) => child,
             None => {
                 let child = push_node(nodes);
-                nodes[parent as usize].any_index_child = Some(child);
+                nodes[parent.index()].any_index_child = Some(child);
                 child
             }
         },
@@ -268,20 +293,24 @@ fn get_or_create_child(nodes: &mut Vec<NodeBuild>, parent: u32, segment: &PathSe
 
 /// Union the src subtree into the dst subtree, cloning actions. Duplicated
 /// actions share their field_bit, so the satisfied bitset dedupes them at runtime.
-fn merge_subtree(nodes: &mut Vec<NodeBuild>, dst: u32, src: u32) {
-    let src_actions = nodes[src as usize].actions.clone();
-    nodes[dst as usize].actions.extend(src_actions);
-    let src_keys = nodes[src as usize].key_children.clone();
+fn merge_subtree(nodes: &mut Vec<NodeBuild>, dst: NodeId, src: NodeId) {
+    let src_actions = nodes[src.index()].actions.clone();
+    nodes[dst.index()].actions.extend(src_actions);
+    let src_keys = nodes[src.index()].key_children.clone();
     for (key, src_child) in src_keys {
         let dst_child = get_or_create_child(nodes, dst, &PathSegment::Key(key));
         merge_subtree(nodes, dst_child, src_child);
     }
-    let src_indices = nodes[src as usize].index_children.clone();
-    for (index, src_child) in src_indices {
-        let dst_child = get_or_create_child(nodes, dst, &PathSegment::Index(index));
+    let src_indices = nodes[src.index()].index_children.clone();
+    for IndexChildRef {
+        index,
+        child: &src_child,
+    } in &src_indices
+    {
+        let dst_child = get_or_create_child(nodes, dst, &PathSegment::Index(*index));
         merge_subtree(nodes, dst_child, src_child);
     }
-    if let Some(src_any) = nodes[src as usize].any_index_child {
+    if let Some(src_any) = nodes[src.index()].any_index_child {
         let dst_any = get_or_create_child(nodes, dst, &PathSegment::AnyIndex);
         merge_subtree(nodes, dst_any, src_any);
     }
@@ -292,24 +321,25 @@ fn merge_subtree(nodes: &mut Vec<NodeBuild>, dst: u32, src: u32) {
 /// Compile-time cost: every fixed-index sibling gets its own copy of the wildcard
 /// subtree, so patterns stacking wildcards under many fixed indices at several
 /// levels can grow multiplicatively. Match-time cost is unaffected.
-fn merge_wildcards(nodes: &mut Vec<NodeBuild>, node: u32) {
-    if let Some(any) = nodes[node as usize].any_index_child {
-        let fixed: Vec<u32> = nodes[node as usize]
+fn merge_wildcards(nodes: &mut Vec<NodeBuild>, node: NodeId) {
+    if let Some(any) = nodes[node.index()].any_index_child {
+        let fixed: Vec<NodeId> = nodes[node.index()]
             .index_children
+            .child()
             .iter()
-            .map(|&(_, c)| c)
+            .copied()
             .collect();
         for child in fixed {
             merge_subtree(nodes, child, any);
         }
     }
-    let mut children: Vec<u32> = nodes[node as usize]
+    let mut children: Vec<NodeId> = nodes[node.index()]
         .key_children
         .iter()
         .map(|&(_, c)| c)
         .collect();
-    children.extend(nodes[node as usize].index_children.iter().map(|&(_, c)| c));
-    children.extend(nodes[node as usize].any_index_child);
+    children.extend(nodes[node.index()].index_children.child().iter().copied());
+    children.extend(nodes[node.index()].any_index_child);
     for child in children {
         merge_wildcards(nodes, child);
     }
@@ -362,7 +392,7 @@ impl MatchMachine {
             set_required_counts.push(set.field_matches.len() as u32);
             let mut next_set_capture_index: u32 = 0;
             for (field_index, field) in set.field_matches.iter().enumerate() {
-                let mut node: u32 = 0;
+                let mut node: NodeId = NodeId(0);
                 for segment in field.path {
                     node = get_or_create_child(&mut nodes, node, segment);
                 }
@@ -406,7 +436,7 @@ impl MatchMachine {
                     next_predicate_loc += 1;
                 }
 
-                nodes[node as usize].actions.push(Action {
+                nodes[node.index()].actions.push(Action {
                     set_index: set_index as u32,
                     field_bit: next_field_bit,
                     type_check: field.r#type.clone(),
@@ -419,19 +449,18 @@ impl MatchMachine {
             }
         }
 
-        merge_wildcards(&mut nodes, 0);
+        merge_wildcards(&mut nodes, NodeId(0));
 
         let mut actions: Vec<Action> = Vec::new();
         let mut final_nodes: Vec<Node> = Vec::with_capacity(nodes.len());
         for mut build in nodes {
             let start = actions.len() as u32;
             actions.append(&mut build.actions);
-            build
-                .index_children
-                .sort_unstable_by_key(|&(index, _)| index);
+            let mut index_children = build.index_children.into_iter().collect::<Vec<_>>();
+            index_children.sort_unstable_by_key(|&IndexChild { index, .. }| index);
             final_nodes.push(Node {
                 key_children: build.key_children.into_boxed_slice(),
-                index_children: build.index_children.into_boxed_slice(),
+                index_children: index_children.into_iter().collect(),
                 any_index_child: build.any_index_child,
                 actions: Range {
                     start,
@@ -468,7 +497,7 @@ impl MatchMachine {
             bytes: string.as_bytes(),
         };
         let pos = matcher.skip_ws(0);
-        let end = matcher.process_value(pos as u32, 0, state)?;
+        let end = matcher.process_value(pos as u32, NodeId(0), state)?;
         let end = matcher.skip_ws(end);
         if end != matcher.bytes.len() as u32 {
             return Err(MatchError::TrailingData { pos: end });
@@ -512,10 +541,10 @@ impl Matcher<'_, '_> {
     fn process_value(
         &self,
         pos: u32,
-        node_index: u32,
+        node_index: NodeId,
         state: &mut MachineState,
     ) -> Result<u32, MatchError> {
-        let node = &self.machine.nodes[node_index as usize];
+        let node = &self.machine.nodes[node_index.index()];
         let first = self.peek(pos)?;
         let mut string_escaped = false;
         let end = match first {
@@ -584,7 +613,7 @@ impl Matcher<'_, '_> {
         content: Range<u32>,
         escaped: bool,
         state: &mut MachineState,
-    ) -> Result<Option<u32>, MatchError> {
+    ) -> Result<Option<NodeId>, MatchError> {
         let raw = if !escaped {
             &self.bytes[range_u32_to_usize(content)]
         } else {
@@ -616,15 +645,65 @@ impl Matcher<'_, '_> {
         if self.peek(pos)? == b']' {
             return Ok(pos + 1);
         }
-        let mut index: u32 = 0;
-        loop {
-            let child = match node
-                .index_children
-                .binary_search_by_key(&index, |&(i, _)| i)
-            {
-                Ok(found) => Some(node.index_children[found].1),
+        // TODO: mark likely()
+        if node.index_children.len() <= 512 {
+            for index in 0..=u16::MAX {
+                let child = match node.index_children.index().binary_search(&index) {
+                    Ok(found) => Some(node.index_children.child()[found]),
+                    Err(_) => node.any_index_child,
+                };
+                pos = match child {
+                    Some(child) => self.process_value(pos, child, state)?,
+                    None => self.validate_value(pos, state)?,
+                };
+                pos = self.skip_ws(pos);
+                match self.peek(pos)? {
+                    b',' => pos = self.skip_ws(pos + 1),
+                    b']' => return Ok(pos + 1),
+                    byte => return Err(MatchError::UnexpectedByte { pos, byte }),
+                }
+            }
+            self.walk_array_huge(pos, node, state, u16::MAX as u32)
+        } else {
+            self.walk_array_large(pos, node, state)
+        }
+    }
+
+    fn walk_array_large(
+        &self,
+        mut pos: u32,
+        node: &Node,
+        state: &mut MachineState,
+    ) -> Result<u32, MatchError> {
+        for index in 0..=u16::MAX {
+            let child = match node.index_children.index().binary_search(&index) {
+                Ok(found) => Some(node.index_children.child()[found]),
                 Err(_) => node.any_index_child,
             };
+            pos = match child {
+                Some(child) => self.process_value(pos, child, state)?,
+                None => self.validate_value(pos, state)?,
+            };
+            pos = self.skip_ws(pos);
+            match self.peek(pos)? {
+                b',' => pos = self.skip_ws(pos + 1),
+                b']' => return Ok(pos + 1),
+                byte => return Err(MatchError::UnexpectedByte { pos, byte }),
+            }
+        }
+        self.walk_array_huge(pos, node, state, u16::MAX as u32)
+    }
+
+    #[cold]
+    fn walk_array_huge(
+        &self,
+        mut pos: u32,
+        node: &Node,
+        state: &mut MachineState,
+        mut index: u32,
+    ) -> Result<u32, MatchError> {
+        loop {
+            let child = node.any_index_child;
             pos = match child {
                 Some(child) => self.process_value(pos, child, state)?,
                 None => self.validate_value(pos, state)?,

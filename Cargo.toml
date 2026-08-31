@@ -4,20 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-serde=["dep:serde", "compact_str/serde"]
+serde = ["dep:serde", "compact_str/serde"]
+benchmarking = ["dep:rand"]
 
 [dependencies]
 bitvec = "1.1.1"
 compact_str = "0.10.0"
-rand = "0.10.2"
+rand = { version = "0.10.2", default-features = false, features = ["std_rng"], optional = true }
 regex = "1.13.1"
-serde = { version = "1.0.229", features = ["derive"], optional=true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+soa-rs = "1.0.1"
 thiserror = "2.0.20"
 
 [dev-dependencies]
 criterion = "0.8.2"
 serde_json = "1.0.151"
+rand = { version = "0.10.2", default-features = false, features = ["std_rng"] }
 
 [[bench]]
 name = "brrrrt"
 harness = false
+required-features = ["benchmarking"]

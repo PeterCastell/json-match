@@ -6,38 +6,43 @@
 //! path and type, so patterns fed to it should be predicate-free (or use
 //! predicates that accept any generated value).
 
-use crate::{FieldMatch, FieldType, PathSegment};
 use compact_str::CompactString;
-use rand::RngExt;
 use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
+use rand::{Rng, RngExt};
+
+use crate::{FieldPattern, FieldType, NodeId, PathSegment};
 
 #[derive(Default)]
 struct GenNode<'a> {
-    key_children: Vec<(&'a str, usize)>,
-    index_children: Vec<(u32, usize)>,
-    any_index_child: Option<usize>,
+    key_children: Vec<(&'a str, NodeId)>,
+    index_children: Vec<(u16, NodeId)>,
+    any_index_child: Option<NodeId>,
     terminals: Vec<&'a FieldType>,
 }
 
-fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &'a PathSegment) -> usize {
-    fn push<'a>(nodes: &mut Vec<GenNode<'a>>) -> usize {
+fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: NodeId, segment: &'a PathSegment) -> NodeId {
+    fn push<'a>(nodes: &mut Vec<GenNode<'a>>) -> NodeId {
         nodes.push(GenNode::default());
-        nodes.len() - 1
+        NodeId((nodes.len() - 1).try_into().unwrap())
     }
     match segment {
         PathSegment::Key(key) => {
             let key = key.as_str();
-            if let Some(&(_, child)) = nodes[parent].key_children.iter().find(|&&(k, _)| k == key) {
+            if let Some(&(_, child)) = nodes[parent.index()]
+                .key_children
+                .iter()
+                .find(|&&(k, _)| k == key)
+            {
                 child
             } else {
                 let child = push(nodes);
-                nodes[parent].key_children.push((key, child));
+                nodes[parent.index()].key_children.push((key, child));
                 child
             }
         }
         PathSegment::Index(index) => {
-            if let Some(&(_, child)) = nodes[parent]
+            if let Some(&(_, child)) = nodes[parent.index()]
                 .index_children
                 .iter()
                 .find(|&&(i, _)| i == *index)
@@ -45,15 +50,15 @@ fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &'a PathS
                 child
             } else {
                 let child = push(nodes);
-                nodes[parent].index_children.push((*index, child));
+                nodes[parent.index()].index_children.push((*index, child));
                 child
             }
         }
-        PathSegment::AnyIndex => match nodes[parent].any_index_child {
+        PathSegment::AnyIndex => match nodes[parent.index()].any_index_child {
             Some(child) => child,
             None => {
                 let child = push(nodes);
-                nodes[parent].any_index_child = Some(child);
+                nodes[parent.index()].any_index_child = Some(child);
                 child
             }
         },
@@ -61,7 +66,7 @@ fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &'a PathS
 }
 
 pub fn generate_test_json(
-    fields: &[FieldMatch<'_>],
+    fields: &[FieldPattern<'_>],
     closeness: f64,
     bloat: f64,
     rng: &mut StdRng,
@@ -81,11 +86,11 @@ pub fn generate_test_json(
     let mut nodes: Vec<GenNode<'_>> = vec![GenNode::default()];
     for &field_index in &indices[..count] {
         let field = &fields[field_index];
-        let mut node = 0usize;
+        let mut node = NodeId(0);
         for segment in field.path {
             node = gen_child(&mut nodes, node, segment);
         }
-        nodes[node].terminals.push(&field.r#type);
+        nodes[node.index()].terminals.push(&field.r#type);
     }
 
     let mut emitter = Emitter {
@@ -93,7 +98,7 @@ pub fn generate_test_json(
         rng,
         bloat,
     };
-    emitter.value(0, 1)
+    emitter.value(NodeId(0), 1)
 }
 
 struct Emitter<'n, 'a, 'r> {
@@ -103,31 +108,31 @@ struct Emitter<'n, 'a, 'r> {
 }
 
 impl Emitter<'_, '_, '_> {
-    fn value(&mut self, node: usize, level: usize) -> String {
+    fn value(&mut self, node: NodeId, level: usize) -> String {
         // Structure demanded by children takes priority over terminal types:
         // a node used as a path prefix must be a container.
-        if !self.nodes[node].key_children.is_empty() {
+        if !self.nodes[node.index()].key_children.is_empty() {
             self.object(node, level)
-        } else if !self.nodes[node].index_children.is_empty()
-            || self.nodes[node].any_index_child.is_some()
+        } else if !self.nodes[node.index()].index_children.is_empty()
+            || self.nodes[node.index()].any_index_child.is_some()
         {
             self.array(node, level)
-        } else if let Some(ty) = self.nodes[node].terminals.first() {
+        } else if let Some(ty) = self.nodes[node.index()].terminals.first() {
             self.terminal(ty)
         } else {
             self.primitive()
         }
     }
 
-    fn object(&mut self, node: usize, level: usize) -> String {
-        let real_keys: Vec<&str> = self.nodes[node]
+    fn object(&mut self, node: NodeId, level: usize) -> String {
+        let real_keys: Vec<&str> = self.nodes[node.index()]
             .key_children
             .iter()
             .map(|&(k, _)| k)
             .collect();
         let mut members: Vec<String> = Vec::new();
-        for i in 0..self.nodes[node].key_children.len() {
-            let (name, child) = self.nodes[node].key_children[i];
+        for i in 0..self.nodes[node.index()].key_children.len() {
+            let (name, child) = self.nodes[node.index()].key_children[i];
             let value = self.value(child, level + 1);
             members.push(format!("{:?}:{}", name, value));
         }
@@ -155,21 +160,21 @@ impl Emitter<'_, '_, '_> {
         format!("{{{}}}", members.join(","))
     }
 
-    fn array(&mut self, node: usize, level: usize) -> String {
-        let base_len = self.nodes[node]
+    fn array(&mut self, node: NodeId, level: usize) -> String {
+        let base_len = self.nodes[node.index()]
             .index_children
             .iter()
             .map(|&(i, _)| i as usize + 1)
             .max()
             .unwrap_or(0);
-        let extra = usize::from(self.nodes[node].any_index_child.is_some())
+        let extra = usize::from(self.nodes[node.index()].any_index_child.is_some())
             + (self.bloat * 2.0).floor() as usize;
-        let mut slots: Vec<Option<usize>> = vec![None; base_len + extra];
-        for i in 0..self.nodes[node].index_children.len() {
-            let (index, child) = self.nodes[node].index_children[i];
+        let mut slots: Vec<Option<NodeId>> = vec![None; base_len + extra];
+        for i in 0..self.nodes[node.index()].index_children.len() {
+            let (index, child) = self.nodes[node.index()].index_children[i];
             slots[index as usize] = Some(child);
         }
-        if let Some(any_child) = self.nodes[node].any_index_child {
+        if let Some(any_child) = self.nodes[node.index()].any_index_child {
             // Never place the wildcard element at a fixed index: those slots
             // carry their own required structure.
             let free: Vec<usize> = slots
@@ -270,7 +275,7 @@ fn rand_name(rng: &mut StdRng) -> String {
         .collect()
 }
 
-fn noise_number(rng: &mut StdRng) -> String {
+fn noise_number(rng: &mut impl Rng) -> String {
     if rng.random_bool(0.5) {
         rng.random_range(-1_000..1_000i64).to_string()
     } else {
@@ -279,7 +284,7 @@ fn noise_number(rng: &mut StdRng) -> String {
 }
 
 /// A representative predicate-free pattern, shared by tests and benches.
-pub fn test_fields() -> Vec<FieldMatch<'static>> {
+pub fn test_fields() -> Vec<FieldPattern<'static>> {
     use PathSegment::{AnyIndex, Index, Key};
     const fn key(s: &'static str) -> PathSegment {
         Key(CompactString::const_new(s))
@@ -291,37 +296,37 @@ pub fn test_fields() -> Vec<FieldMatch<'static>> {
     static LIST_0_NAME: [PathSegment; 3] = [key("list"), Index(0), key("name")];
     static LIST_ANY_ID: [PathSegment; 3] = [key("list"), AnyIndex, key("id")];
     vec![
-        FieldMatch {
+        FieldPattern {
             path: &FOO,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
-        FieldMatch {
+        FieldPattern {
             path: &A_B,
             r#type: FieldType::Bool,
             predicate: None,
             capture: true,
         },
-        FieldMatch {
+        FieldPattern {
             path: &A_C,
             r#type: FieldType::Object,
             predicate: None,
             capture: true,
         },
-        FieldMatch {
+        FieldPattern {
             path: &A_C_D,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
-        FieldMatch {
+        FieldPattern {
             path: &LIST_0_NAME,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
-        FieldMatch {
+        FieldPattern {
             path: &LIST_ANY_ID,
             r#type: FieldType::Number,
             predicate: None,
@@ -332,16 +337,16 @@ pub fn test_fields() -> Vec<FieldMatch<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_test_json, test_fields};
-    use crate::*;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-    use regex::Regex;
+    use crate::{
+        CaptureValue, DEFAULT_DEPTH_LIMIT, FieldPattern, FieldType, MachineState, MatchError,
+        MatchMachine, PathSegment, Pattern, UnescapedString, range_u32_to_usize,
+        testing::{generate_test_json, test_fields},
+    };
 
     /// Machine capture indices keyed by (set index, field index, predicate group name).
     type CaptureIndices = std::collections::HashMap<(u32, u32, Option<String>), u32>;
 
-    fn compile(sets: &[&[FieldMatch<'_>]]) -> (MatchMachine, CaptureIndices) {
+    fn compile(sets: &[&[FieldPattern<'_>]]) -> (MatchMachine, CaptureIndices) {
         let mut captures = std::collections::HashMap::new();
         let machine = MatchMachine::compile(
             sets.iter().map(|fields| Pattern {
@@ -374,8 +379,8 @@ mod tests {
         r#type: FieldType,
         predicate: Option<&str>,
         capture: bool,
-    ) -> FieldMatch<'static> {
-        FieldMatch {
+    ) -> FieldPattern<'static> {
+        FieldPattern {
             path: Vec::leak(path),
             r#type,
             predicate: predicate.map(|p| Regex::new(p).unwrap()),
@@ -388,6 +393,8 @@ mod tests {
     }
 
     use PathSegment::*;
+    use rand::{SeedableRng, rngs::StdRng};
+    use regex::Regex;
 
     #[test]
     fn basic_nested_capture() {
@@ -590,7 +597,7 @@ mod tests {
     fn multiple_sets_independent() {
         let a = [field(vec![key("a")], FieldType::Number, None, false)];
         let b = [field(vec![key("a")], FieldType::String, None, false)];
-        let empty: [FieldMatch<'_>; 0] = [];
+        let empty: [FieldPattern<'_>; 0] = [];
         let (machine, _) = compile(&[&a, &b, &empty]);
         assert_eq!(machine.num_match_sets(), 3);
         let state = run(&machine, r#"{"a":1}"#).unwrap();
@@ -1088,6 +1095,7 @@ mod tests {
             assert!(!state.result.did_match(0), "should not match: {json}");
         }
     }
+
     #[test]
     fn print_generater_json() {
         let mut rng = StdRng::seed_from_u64(0xB00B5);
