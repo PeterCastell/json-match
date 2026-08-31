@@ -3,11 +3,15 @@ name = "json-match"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+serde=["dep:serde", "compact_str/serde"]
+
 [dependencies]
 bitvec = "1.1.1"
 compact_str = "0.10.0"
 rand = "0.10.2"
 regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"], optional=true }
 thiserror = "2.0.20"
 
 [dev-dependencies]

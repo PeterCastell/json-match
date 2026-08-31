@@ -159,6 +159,7 @@ dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
+ "serde",
  "static_assertions",
  "zmij",
 ]
@@ -338,6 +339,7 @@ dependencies = [
  "criterion",
  "rand",
  "regex",
+ "serde",
  "serde_json",
  "thiserror",
 ]

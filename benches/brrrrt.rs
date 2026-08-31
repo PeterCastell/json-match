@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use json_match::testing::{generate_test_json, test_fields};
-use json_match::{MatchMachine, MatchSet};
+use json_match::{MatchMachine, Pattern};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::hint::black_box;
@@ -8,7 +8,7 @@ use std::hint::black_box;
 fn bench_match(c: &mut Criterion) {
     let fields = test_fields();
     let machine = MatchMachine::compile(
-        std::iter::once(MatchSet {
+        std::iter::once(Pattern {
             field_matches: &fields,
         }),
         |_| {},

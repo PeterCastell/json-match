@@ -3,24 +3,30 @@
 use bitvec::{bitbox, boxed::BitBox, order::Lsb0};
 use compact_str::CompactString;
 use regex::{CaptureLocations, Regex};
-use std::{assert_matches, range::Range};
+use std::range::Range;
 
 pub mod testing;
 
-pub struct MatchSet<'a> {
+pub struct Pattern<'a> {
     pub field_matches: &'a [FieldMatch<'a>],
 }
 
+
 pub struct FieldMatch<'a> {
-    pub path: &'a [PathSegment<'a>],
+    pub path: &'a [PathSegment],
     pub r#type: FieldType,
+    /// Regex the value must satisfy for the field to count as present. Runs
+    /// unanchored (a substring match anywhere in the value); anchor with
+    /// `^`/`$` to require a full-value match. For strings the haystack is the
+    /// unescaped content; for every other type it is the raw JSON text.
     pub predicate: Option<Regex>,
     pub capture: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum PathSegment<'a> {
-    Key(&'a str),
+#[cfg_attr(feature="serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug)]
+pub enum PathSegment {
+    Key(CompactString),
     /// Fixed array index.
     Index(u32),
     /// First array element whose continuation satisfies this field.
@@ -29,6 +35,7 @@ pub enum PathSegment<'a> {
     AnyIndex,
 }
 
+#[cfg_attr(feature="serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub enum FieldType {
     Object,
@@ -51,6 +58,9 @@ pub enum CaptureValue {
     Object(Range<u32>),
     Array(Range<u32>),
     String(UnescapedString),
+    /// Parsed as f64: integers with magnitude above 2^53 lose precision.
+    /// Literals outside the finite f64 range fail the match with
+    /// [`MatchError::NumberOutOfRange`] instead of capturing ±inf.
     Number(f64),
     Bool(bool),
     Null,
@@ -109,6 +119,13 @@ pub enum MatchError {
     TrailingData { pos: u32 },
     #[error("invalid number at offset {pos}")]
     InvalidNumber { pos: u32 },
+    /// A captured number literal is outside the finite f64 range (e.g.
+    /// `1e999`). Only captured numbers are parsed; uncaptured ones are
+    /// validated syntactically without a range check.
+    #[error("number out of f64 range at offset {pos}")]
+    NumberOutOfRange { pos: u32 },
+    #[error("input length {len} exceeds u32::MAX bytes")]
+    InputTooLong { len: usize },
     #[error("invalid string escape at offset {pos}")]
     InvalidEscape { pos: u32 },
     #[error("nesting depth limit exceeded at offset {pos}")]
@@ -210,19 +227,19 @@ fn push_node(nodes: &mut Vec<NodeBuild>) -> u32 {
     index
 }
 
-fn get_or_create_child(nodes: &mut Vec<NodeBuild>, parent: u32, segment: PathSegment) -> u32 {
+fn get_or_create_child(nodes: &mut Vec<NodeBuild>, parent: u32, segment: &PathSegment) -> u32 {
     match segment {
         PathSegment::Key(key) => {
             let existing = nodes[parent as usize]
                 .key_children
                 .iter()
-                .find(|(k, _)| k.as_str() == key)
+                .find(|(k, _)| k == key)
                 .map(|&(_, child)| child);
             existing.unwrap_or_else(|| {
                 let child = push_node(nodes);
                 nodes[parent as usize]
                     .key_children
-                    .push((CompactString::from(key), child));
+                    .push((key.clone(), child));
                 child
             })
         }
@@ -230,11 +247,11 @@ fn get_or_create_child(nodes: &mut Vec<NodeBuild>, parent: u32, segment: PathSeg
             let existing = nodes[parent as usize]
                 .index_children
                 .iter()
-                .find(|&&(i, _)| i == index)
+                .find(|&&(i, _)| i == *index)
                 .map(|&(_, child)| child);
             existing.unwrap_or_else(|| {
                 let child = push_node(nodes);
-                nodes[parent as usize].index_children.push((index, child));
+                nodes[parent as usize].index_children.push((*index, child));
                 child
             })
         }
@@ -256,22 +273,25 @@ fn merge_subtree(nodes: &mut Vec<NodeBuild>, dst: u32, src: u32) {
     nodes[dst as usize].actions.extend(src_actions);
     let src_keys = nodes[src as usize].key_children.clone();
     for (key, src_child) in src_keys {
-        let dst_child = get_or_create_child(nodes, dst, PathSegment::Key(key.as_str()));
+        let dst_child = get_or_create_child(nodes, dst, &PathSegment::Key(key));
         merge_subtree(nodes, dst_child, src_child);
     }
     let src_indices = nodes[src as usize].index_children.clone();
     for (index, src_child) in src_indices {
-        let dst_child = get_or_create_child(nodes, dst, PathSegment::Index(index));
+        let dst_child = get_or_create_child(nodes, dst, &PathSegment::Index(index));
         merge_subtree(nodes, dst_child, src_child);
     }
     if let Some(src_any) = nodes[src as usize].any_index_child {
-        let dst_any = get_or_create_child(nodes, dst, PathSegment::AnyIndex);
+        let dst_any = get_or_create_child(nodes, dst, &PathSegment::AnyIndex);
         merge_subtree(nodes, dst_any, src_any);
     }
 }
 
 /// Wherever a node has both fixed-index children and a wildcard child, merge the
 /// wildcard subtree into each fixed subtree so array elements resolve to one node.
+/// Compile-time cost: every fixed-index sibling gets its own copy of the wildcard
+/// subtree, so patterns stacking wildcards under many fixed indices at several
+/// levels can grow multiplicatively. Match-time cost is unaffected.
 fn merge_wildcards(nodes: &mut Vec<NodeBuild>, node: u32) {
     if let Some(any) = nodes[node as usize].any_index_child {
         let fixed: Vec<u32> = nodes[node as usize]
@@ -329,7 +349,7 @@ impl MatchMachine {
     }
 
     pub fn compile<'a>(
-        match_sets: impl Iterator<Item = MatchSet<'a>>,
+        match_sets: impl Iterator<Item = Pattern<'a>>,
         mut capture_index_callback: impl FnMut(CaptureCallbackArgs),
     ) -> Result<MatchMachine, CompileError> {
         let mut nodes: Vec<NodeBuild> = vec![NodeBuild::default()];
@@ -343,7 +363,7 @@ impl MatchMachine {
             let mut next_set_capture_index: u32 = 0;
             for (field_index, field) in set.field_matches.iter().enumerate() {
                 let mut node: u32 = 0;
-                for &segment in field.path {
+                for segment in field.path {
                     node = get_or_create_child(&mut nodes, node, segment);
                 }
 
@@ -430,9 +450,12 @@ impl MatchMachine {
         })
     }
 
+    /// Inputs are limited to u32::MAX bytes; longer strings are rejected with
+    /// [`MatchError::InputTooLong`].
     pub fn match_string(&self, string: &str, state: &mut MachineState) -> Result<(), MatchError> {
-        const MAX_STR_LEN: usize = u32::MAX as usize;
-        assert_matches!(string.len(), 0..MAX_STR_LEN);
+        if string.len() > u32::MAX as usize {
+            return Err(MatchError::InputTooLong { len: string.len() });
+        }
 
         state.result.capture_values.fill(CaptureValue::NotCaptured);
         state.result.match_results.fill(false);
@@ -562,13 +585,8 @@ impl Matcher<'_, '_> {
         escaped: bool,
         state: &mut MachineState,
     ) -> Result<Option<u32>, MatchError> {
-        if !escaped {
-            let raw = &self.bytes[range_u32_to_usize(content)];
-            for (key, child) in &node.key_children {
-                if key.as_bytes() == raw {
-                    return Ok(Some(*child));
-                }
-            }
+        let raw = if !escaped {
+            &self.bytes[range_u32_to_usize(content)]
         } else {
             state.unescape_buf.clear();
             unescape_into(
@@ -576,13 +594,16 @@ impl Matcher<'_, '_> {
                 &mut state.unescape_buf,
                 content.start,
             )?;
-            for (key, child) in &node.key_children {
-                if key.as_str() == state.unescape_buf {
-                    return Ok(Some(*child));
-                }
-            }
-        }
-        Ok(None)
+            state.unescape_buf.as_bytes()
+        };
+        // Linear scan: nodes rarely have more than a handful of keys, and the
+        // length pre-check in slice equality rejects most candidates in one
+        // comparison — measurably faster here than binary search.
+        Ok(node
+            .key_children
+            .iter()
+            .find(|(key, _)| key.as_bytes() == raw)
+            .map(|&(_, child)| child))
     }
 
     fn walk_array(
@@ -701,13 +722,15 @@ impl Matcher<'_, '_> {
         Ok(self.skip_ws(pos + 1))
     }
 
+    #[inline]
     fn expect_keyword(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
-        let end = pos + keyword.len() as u32;
-        if (self.bytes.len() as u32) < end {
-            return Err(MatchError::UnexpectedEof);
-        }
-        if &self.bytes[pos as usize..end as usize] == keyword {
-            Ok(end)
+        let end = (pos as usize) + keyword.len();
+        let bytes = self
+            .bytes
+            .get(pos as usize..end)
+            .ok_or(MatchError::UnexpectedEof)?;
+        if bytes == keyword {
+            Ok(end as u32)
         } else {
             Err(MatchError::UnexpectedByte {
                 pos,
@@ -767,6 +790,11 @@ impl Matcher<'_, '_> {
     /// syntax (including surrogate pairing, matching `unescape_into`) and no
     /// raw control characters. Returns (position past the closing quote,
     /// whether the content contains escape sequences).
+    // NOTE: bulk scanning strategies (memchr2 and SWAR word-at-a-time) were
+    // benchmarked here and lost to this byte loop by 5-70% on the generated
+    // workload, whose strings are all 3-8 bytes: any per-string setup cost
+    // outweighs the scan. Revisit only with a benchmark containing long
+    // strings, where word-at-a-time skipping should win decisively.
     fn validate_string(&self, pos: u32) -> Result<(u32, bool), MatchError> {
         let mut i = pos + 1;
         let mut escaped = false;
@@ -942,7 +970,10 @@ impl Matcher<'_, '_> {
             _ => {
                 let text = &self.input[range_u32_to_usize(range)];
                 match text.parse::<f64>() {
-                    Ok(number) => CaptureValue::Number(number),
+                    // JSON has no infinities: literals that overflow f64
+                    // (e.g. 1e999) fail the match rather than capture ±inf.
+                    Ok(number) if number.is_finite() => CaptureValue::Number(number),
+                    Ok(_) => return Err(MatchError::NumberOutOfRange { pos: range.start }),
                     Err(_) => return Err(MatchError::InvalidNumber { pos: range.start }),
                 }
             }

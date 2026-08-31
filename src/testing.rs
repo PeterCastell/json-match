@@ -7,6 +7,7 @@
 //! predicates that accept any generated value).
 
 use crate::{FieldMatch, FieldType, PathSegment};
+use compact_str::CompactString;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
@@ -19,14 +20,15 @@ struct GenNode<'a> {
     terminals: Vec<&'a FieldType>,
 }
 
-fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &PathSegment<'a>) -> usize {
+fn gen_child<'a>(nodes: &mut Vec<GenNode<'a>>, parent: usize, segment: &'a PathSegment) -> usize {
     fn push<'a>(nodes: &mut Vec<GenNode<'a>>) -> usize {
         nodes.push(GenNode::default());
         nodes.len() - 1
     }
     match segment {
         PathSegment::Key(key) => {
-            if let Some(&(_, child)) = nodes[parent].key_children.iter().find(|(k, _)| k == key) {
+            let key = key.as_str();
+            if let Some(&(_, child)) = nodes[parent].key_children.iter().find(|&&(k, _)| k == key) {
                 child
             } else {
                 let child = push(nodes);
@@ -278,40 +280,49 @@ fn noise_number(rng: &mut StdRng) -> String {
 
 /// A representative predicate-free pattern, shared by tests and benches.
 pub fn test_fields() -> Vec<FieldMatch<'static>> {
-    use PathSegment::*;
+    use PathSegment::{AnyIndex, Index, Key};
+    const fn key(s: &'static str) -> PathSegment {
+        Key(CompactString::const_new(s))
+    }
+    static FOO: [PathSegment; 1] = [key("foo")];
+    static A_B: [PathSegment; 2] = [key("a"), key("b")];
+    static A_C: [PathSegment; 2] = [key("a"), key("c")];
+    static A_C_D: [PathSegment; 3] = [key("a"), key("c"), key("d")];
+    static LIST_0_NAME: [PathSegment; 3] = [key("list"), Index(0), key("name")];
+    static LIST_ANY_ID: [PathSegment; 3] = [key("list"), AnyIndex, key("id")];
     vec![
         FieldMatch {
-            path: &[Key("foo")],
+            path: &FOO,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
         FieldMatch {
-            path: &[Key("a"), Key("b")],
+            path: &A_B,
             r#type: FieldType::Bool,
             predicate: None,
             capture: true,
         },
         FieldMatch {
-            path: &[Key("a"), Key("c")],
+            path: &A_C,
             r#type: FieldType::Object,
             predicate: None,
             capture: true,
         },
         FieldMatch {
-            path: &[Key("a"), Key("c"), Key("d")],
+            path: &A_C_D,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
         FieldMatch {
-            path: &[Key("list"), Index(0), Key("name")],
+            path: &LIST_0_NAME,
             r#type: FieldType::String,
             predicate: None,
             capture: true,
         },
         FieldMatch {
-            path: &[Key("list"), AnyIndex, Key("id")],
+            path: &LIST_ANY_ID,
             r#type: FieldType::Number,
             predicate: None,
             capture: true,
@@ -333,7 +344,7 @@ mod tests {
     fn compile(sets: &[&[FieldMatch<'_>]]) -> (MatchMachine, CaptureIndices) {
         let mut captures = std::collections::HashMap::new();
         let machine = MatchMachine::compile(
-            sets.iter().map(|fields| MatchSet {
+            sets.iter().map(|fields| Pattern {
                 field_matches: fields,
             }),
             |args| {
@@ -357,25 +368,30 @@ mod tests {
         Ok(state)
     }
 
-    fn field<'a>(
-        path: &'a [PathSegment<'a>],
+    /// Leaks the path to satisfy FieldMatch's borrowed slice; fine in tests.
+    fn field(
+        path: Vec<PathSegment>,
         r#type: FieldType,
         predicate: Option<&str>,
         capture: bool,
-    ) -> FieldMatch<'a> {
+    ) -> FieldMatch<'static> {
         FieldMatch {
-            path,
+            path: Vec::leak(path),
             r#type,
             predicate: predicate.map(|p| Regex::new(p).unwrap()),
             capture,
         }
     }
 
+    fn key(s: &str) -> PathSegment {
+        PathSegment::Key(s.into())
+    }
+
     use PathSegment::*;
 
     #[test]
     fn basic_nested_capture() {
-        let fields = [field(&[Key("a"), Key("b")], FieldType::Bool, None, true)];
+        let fields = [field(vec![key("a"), key("b")], FieldType::Bool, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"x":1,"a":{"y":[3],"b":true},"z":null}"#).unwrap();
         assert!(state.result.did_match(0));
@@ -387,7 +403,7 @@ mod tests {
 
     #[test]
     fn type_mismatch_no_match() {
-        let fields = [field(&[Key("a")], FieldType::Number, None, false)];
+        let fields = [field(vec![key("a")], FieldType::Number, None, false)];
         let (machine, _) = compile(&[&fields]);
         let state = run(&machine, r#"{"a":"not a number"}"#).unwrap();
         assert!(!state.result.did_match(0));
@@ -397,12 +413,12 @@ mod tests {
     fn all_capture_types() {
         let input = r#"{"o":{"k":1},"ar":[1,2],"s":"hi","n":-12.5e2,"b":false,"nul":null}"#;
         let fields = [
-            field(&[Key("o")], FieldType::Object, None, true),
-            field(&[Key("ar")], FieldType::Array, None, true),
-            field(&[Key("s")], FieldType::String, None, true),
-            field(&[Key("n")], FieldType::Number, None, true),
-            field(&[Key("b")], FieldType::Bool, None, true),
-            field(&[Key("nul")], FieldType::Null, None, true),
+            field(vec![key("o")], FieldType::Object, None, true),
+            field(vec![key("ar")], FieldType::Array, None, true),
+            field(vec![key("s")], FieldType::String, None, true),
+            field(vec![key("n")], FieldType::Number, None, true),
+            field(vec![key("b")], FieldType::Bool, None, true),
+            field(vec![key("nul")], FieldType::Null, None, true),
         ];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
@@ -440,12 +456,12 @@ mod tests {
         let input = r#"{"lit":[1,2,3],"any":{"deep":1}}"#;
         let fields = [
             field(
-                &[Key("lit")],
+                vec![key("lit")],
                 FieldType::Literal("[1,2,3]".into()),
                 None,
                 true,
             ),
-            field(&[Key("any")], FieldType::Any, None, true),
+            field(vec![key("any")], FieldType::Any, None, true),
         ];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
@@ -464,7 +480,7 @@ mod tests {
     #[test]
     fn borrowed_string_is_range_into_input() {
         let input = r#"{"s":"plain"}"#;
-        let fields = [field(&[Key("s")], FieldType::String, None, true)];
+        let fields = [field(vec![key("s")], FieldType::String, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
@@ -478,7 +494,7 @@ mod tests {
     #[test]
     fn escaped_string_capture_owned() {
         let input = r#"{"s":"line1\nline2 A 😀 \\"}"#;
-        let fields = [field(&[Key("s")], FieldType::String, None, true)];
+        let fields = [field(vec![key("s")], FieldType::String, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
@@ -491,7 +507,7 @@ mod tests {
 
     #[test]
     fn escaped_key_lookup() {
-        let fields = [field(&[Key("a\nb")], FieldType::Number, None, true)];
+        let fields = [field(vec![key("a\nb")], FieldType::Number, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a\nb":7}"#).unwrap();
         assert!(state.result.did_match(0));
@@ -500,7 +516,7 @@ mod tests {
             CaptureValue::Number(7.0)
         );
         // \u escape spelling of a key must also resolve.
-        let fields = [field(&[Key("A")], FieldType::Number, None, false)];
+        let fields = [field(vec![key("A")], FieldType::Number, None, false)];
         let (machine, _) = compile(&[&fields]);
         assert!(run(&machine, r#"{"A":1}"#).unwrap().result.did_match(0));
     }
@@ -509,7 +525,7 @@ mod tests {
     fn predicate_gates_match_and_captures_groups() {
         let input = r#"{"v":"hello-42"}"#;
         let fields = [field(
-            &[Key("v")],
+            vec![key("v")],
             FieldType::String,
             Some(r"^(?<word>\w+)-(?<_junk>\d+)$"),
             true,
@@ -538,7 +554,7 @@ mod tests {
         // Raw JSON text is `x\ny`; the predicate must see a real newline.
         let input = r#"{"v":"x\ny"}"#;
         let fields = [field(
-            &[Key("v")],
+            vec![key("v")],
             FieldType::String,
             Some(r"^x\n(?<tail>y)$"),
             false,
@@ -560,7 +576,7 @@ mod tests {
     #[test]
     fn predicate_on_number_raw_text() {
         let fields = [field(
-            &[Key("n")],
+            vec![key("n")],
             FieldType::Number,
             Some(r"^-?\d+\.\d+$"),
             false,
@@ -572,8 +588,8 @@ mod tests {
 
     #[test]
     fn multiple_sets_independent() {
-        let a = [field(&[Key("a")], FieldType::Number, None, false)];
-        let b = [field(&[Key("a")], FieldType::String, None, false)];
+        let a = [field(vec![key("a")], FieldType::Number, None, false)];
+        let b = [field(vec![key("a")], FieldType::String, None, false)];
         let empty: [FieldMatch<'_>; 0] = [];
         let (machine, _) = compile(&[&a, &b, &empty]);
         assert_eq!(machine.num_match_sets(), 3);
@@ -587,8 +603,8 @@ mod tests {
     #[test]
     fn partial_set_does_not_match() {
         let fields = [
-            field(&[Key("a")], FieldType::Number, None, false),
-            field(&[Key("missing")], FieldType::Number, None, false),
+            field(vec![key("a")], FieldType::Number, None, false),
+            field(vec![key("missing")], FieldType::Number, None, false),
         ];
         let (machine, _) = compile(&[&fields]);
         assert!(!run(&machine, r#"{"a":1}"#).unwrap().result.did_match(0));
@@ -596,7 +612,12 @@ mod tests {
 
     #[test]
     fn duplicate_keys_first_satisfying_wins() {
-        let fields = [field(&[Key("a")], FieldType::String, Some("^[yz]"), true)];
+        let fields = [field(
+            vec![key("a")],
+            FieldType::String,
+            Some("^[yz]"),
+            true,
+        )];
         let (machine, captures) = compile(&[&fields]);
         // First occurrence fails the predicate, second satisfies.
         let input = r#"{"a":"x","a":"y"}"#;
@@ -617,7 +638,12 @@ mod tests {
 
     #[test]
     fn fixed_index() {
-        let fields = [field(&[Key("a"), Index(1)], FieldType::Number, None, true)];
+        let fields = [field(
+            vec![key("a"), Index(1)],
+            FieldType::Number,
+            None,
+            true,
+        )];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, r#"{"a":[10,42,99]}"#).unwrap();
         assert!(state.result.did_match(0));
@@ -638,7 +664,7 @@ mod tests {
     fn any_index_first_satisfying() {
         let input = r#"{"a":["x","bb","ccc","dd"]}"#;
         let fields = [field(
-            &[Key("a"), AnyIndex],
+            vec![key("a"), AnyIndex],
             FieldType::String,
             Some("^..$"),
             true,
@@ -655,7 +681,7 @@ mod tests {
     #[test]
     fn any_index_skips_wrong_types() {
         let fields = [field(
-            &[Key("a"), AnyIndex, Key("id")],
+            vec![key("a"), AnyIndex, key("id")],
             FieldType::Number,
             None,
             true,
@@ -672,7 +698,7 @@ mod tests {
     #[test]
     fn nested_wildcards() {
         let fields = [field(
-            &[Key("a"), AnyIndex, AnyIndex],
+            vec![key("a"), AnyIndex, AnyIndex],
             FieldType::Number,
             None,
             true,
@@ -693,8 +719,8 @@ mod tests {
         // fixed-index subtree at compile time.
         let input = r#"{"a":["s",5]}"#;
         let fields = [
-            field(&[Key("a"), Index(0)], FieldType::Any, None, false),
-            field(&[Key("a"), AnyIndex], FieldType::String, None, true),
+            field(vec![key("a"), Index(0)], FieldType::Any, None, false),
+            field(vec![key("a"), AnyIndex], FieldType::String, None, true),
         ];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
@@ -707,7 +733,12 @@ mod tests {
 
     #[test]
     fn container_mismatch_leaves_unsatisfied() {
-        let fields = [field(&[Key("a"), Key("b")], FieldType::Number, None, false)];
+        let fields = [field(
+            vec![key("a"), key("b")],
+            FieldType::Number,
+            None,
+            false,
+        )];
         let (machine, _) = compile(&[&fields]);
         assert!(!run(&machine, r#"{"a":[1,2]}"#).unwrap().result.did_match(0));
         assert!(!run(&machine, r#"{"a":"b"}"#).unwrap().result.did_match(0));
@@ -716,7 +747,7 @@ mod tests {
     #[test]
     fn empty_path_matches_root() {
         let input = r#"  {"k":1}  "#;
-        let fields = [field(&[], FieldType::Object, None, true)];
+        let fields = [field(vec![], FieldType::Object, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
@@ -730,7 +761,7 @@ mod tests {
 
     #[test]
     fn root_array() {
-        let fields = [field(&[Index(1)], FieldType::Number, None, true)];
+        let fields = [field(vec![Index(1)], FieldType::Number, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, "[1, 2]").unwrap();
         assert!(state.result.did_match(0));
@@ -742,7 +773,7 @@ mod tests {
 
     #[test]
     fn malformed_inputs_error() {
-        let fields = [field(&[Key("a")], FieldType::Any, None, false)];
+        let fields = [field(vec![key("a")], FieldType::Any, None, false)];
         let (machine, _) = compile(&[&fields]);
         assert!(matches!(
             run(&machine, r#"{"a":tru}"#),
@@ -781,7 +812,7 @@ mod tests {
     fn skipped_regions_are_validated() {
         // "a" is the only pattern path; everything else is skipped — and still
         // must be JSON-compliant.
-        let fields = [field(&[Key("a")], FieldType::Any, None, false)];
+        let fields = [field(vec![key("a")], FieldType::Any, None, false)];
         let (machine, _) = compile(&[&fields]);
         for bad in [
             r#"{"noise":01,"a":1}"#,         // leading zero
@@ -814,7 +845,7 @@ mod tests {
 
     #[test]
     fn depth_limit() {
-        let fields = [field(&[Key("a")], FieldType::Any, None, false)];
+        let fields = [field(vec![key("a")], FieldType::Any, None, false)];
         let (machine, _) = compile(&[&fields]);
         let deep = |n: usize| format!("{}0{}", "[".repeat(n), "]".repeat(n));
 
@@ -843,9 +874,72 @@ mod tests {
     }
 
     #[test]
+    fn number_overflow_errors() {
+        // JSON has no infinity: captured literals beyond the finite f64 range
+        // fail the match, agreeing with serde_json ("number out of range").
+        let fields = [field(vec![key("n")], FieldType::Number, None, true)];
+        let (machine, _) = compile(&[&fields]);
+        assert!(matches!(
+            run(&machine, r#"{"n":1e999}"#),
+            Err(MatchError::NumberOutOfRange { pos: 5 })
+        ));
+        assert!(matches!(
+            run(&machine, r#"{"n":-1e999}"#),
+            Err(MatchError::NumberOutOfRange { pos: 5 })
+        ));
+        // Underflow to zero and subnormals are fine.
+        let state = run(&machine, r#"{"n":1e-999}"#).unwrap();
+        assert!(state.result.did_match(0));
+        // Uncaptured numbers are validated syntactically but never parsed,
+        // so no range check applies.
+        let fields = [field(vec![key("n")], FieldType::Number, None, false)];
+        let (machine, _) = compile(&[&fields]);
+        assert!(run(&machine, r#"{"n":1e999}"#).unwrap().result.did_match(0));
+    }
+
+    #[test]
+    fn predicate_is_unanchored() {
+        // Predicates are substring matches unless the pattern anchors itself.
+        let fields = [field(vec![key("v")], FieldType::String, Some("bb"), false)];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"v":"aaabbccc"}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn control_character_boundaries() {
+        let fields = [field(vec![key("v")], FieldType::String, None, true)];
+        let (machine, captures) = compile(&[&fields]);
+        // Escaped NUL is legal JSON.
+        let state = run(&machine, r#"{"v":"\u0000x"}"#).unwrap();
+        match state.result.capture(captures[&(0, 0, None)]) {
+            CaptureValue::String(s) => assert_eq!(s.resolve(r#"{"v":"\u0000x"}"#), "\0x"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Raw DEL (0x7F) is legal; only 0x00..=0x1F are rejected unescaped.
+        let input = "{\"v\":\"\u{7f}\"}";
+        assert!(run(&machine, input).unwrap().result.did_match(0));
+    }
+
+    #[test]
+    fn deep_pattern_path() {
+        // Nesting along matched paths recurses on the call stack, bounded by
+        // pattern depth rather than the state's depth limit.
+        let path: Vec<PathSegment> = (0..1000).map(|_| key("k")).collect();
+        let fields = [field(path, FieldType::Number, None, false)];
+        let (machine, _) = compile(&[&fields]);
+        let json = format!("{}1{}", "{\"k\":".repeat(1000), "}".repeat(1000));
+        assert!(run(&machine, &json).unwrap().result.did_match(0));
+    }
+
+    #[test]
     fn unicode_escapes() {
         let input = "{\"s\":\"\\u0041\\ud83d\\ude00\"}";
-        let fields = [field(&[Key("s")], FieldType::String, None, true)];
+        let fields = [field(vec![key("s")], FieldType::String, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
@@ -856,7 +950,12 @@ mod tests {
 
     #[test]
     fn whitespace_tolerated() {
-        let fields = [field(&[Key("a"), Key("b")], FieldType::Number, None, true)];
+        let fields = [field(
+            vec![key("a"), key("b")],
+            FieldType::Number,
+            None,
+            true,
+        )];
         let (machine, _) = compile(&[&fields]);
         let state = run(&machine, "\n{ \"a\" : { \"b\" :\t42 } }\r\n").unwrap();
         assert!(state.result.did_match(0));
@@ -864,7 +963,7 @@ mod tests {
 
     #[test]
     fn state_reuse_resets_everything() {
-        let fields = [field(&[Key("a")], FieldType::Number, None, true)];
+        let fields = [field(vec![key("a")], FieldType::Number, None, true)];
         let (machine, captures) = compile(&[&fields]);
         let mut state = machine.allocate_state();
         machine.match_string(r#"{"a":1}"#, &mut state).unwrap();
@@ -881,22 +980,22 @@ mod tests {
     fn capture_callback_ordering() {
         let set0 = [
             field(
-                &[Key("a")],
+                vec![key("a")],
                 FieldType::String,
                 Some("(?<g1>x)(?<_skip>y)(?<g2>z)"),
                 true,
             ),
-            field(&[Key("b")], FieldType::Number, None, false),
-            field(&[Key("c")], FieldType::Number, None, true),
+            field(vec![key("b")], FieldType::Number, None, false),
+            field(vec![key("c")], FieldType::Number, None, true),
         ];
-        let set1 = [field(&[Key("d")], FieldType::Number, None, true)];
+        let set1 = [field(vec![key("d")], FieldType::Number, None, true)];
         let mut seen: Vec<(u32, u32, Option<String>, u32, u32)> = Vec::new();
         MatchMachine::compile(
             [
-                MatchSet {
+                Pattern {
                     field_matches: &set0,
                 },
-                MatchSet {
+                Pattern {
                     field_matches: &set1,
                 },
             ]
@@ -945,7 +1044,7 @@ mod tests {
                 let mut value = Some(&parsed);
                 for segment in field.path {
                     value = match (segment, value) {
-                        (PathSegment::Key(key), Some(v)) => v.get(*key),
+                        (PathSegment::Key(key), Some(v)) => v.get(key.as_str()),
                         (PathSegment::Index(index), Some(v)) => v.get(*index as usize),
                         (PathSegment::AnyIndex, _) => {
                             value = None;
