@@ -15,6 +15,8 @@ fn bench_match(c: &mut Criterion) {
     )
     .unwrap();
     let mut state = machine.allocate_state();
+    // High-bloat noise chains nest deeper than the default limit of 128.
+    state.set_depth_limit(2048);
 
     let mut group = c.benchmark_group("match_string");
     for bloat in [0.0, 2.0, 8.0, 16.0, 32.0, 64.0] {

@@ -408,11 +408,13 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::Object(range) => assert_eq!(&input[*range], r#"{"k":1}"#),
+            CaptureValue::Object(range) => {
+                assert_eq!(&input[range_u32_to_usize(*range)], r#"{"k":1}"#)
+            }
             other => panic!("expected Object, got {other:?}"),
         }
         match state.result.capture(captures[&(0, 1, None)]) {
-            CaptureValue::Array(range) => assert_eq!(&input[*range], "[1,2]"),
+            CaptureValue::Array(range) => assert_eq!(&input[range_u32_to_usize(*range)], "[1,2]"),
             other => panic!("expected Array, got {other:?}"),
         }
         match state.result.capture(captures[&(0, 2, None)]) {
@@ -437,14 +439,21 @@ mod tests {
     fn literal_and_any() {
         let input = r#"{"lit":[1,2,3],"any":{"deep":1}}"#;
         let fields = [
-            field(&[Key("lit")], FieldType::Literal("[1,2,3]".into()), None, true),
+            field(
+                &[Key("lit")],
+                FieldType::Literal("[1,2,3]".into()),
+                None,
+                true,
+            ),
             field(&[Key("any")], FieldType::Any, None, true),
         ];
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 1, None)]) {
-            CaptureValue::Object(range) => assert_eq!(&input[*range], r#"{"deep":1}"#),
+            CaptureValue::Object(range) => {
+                assert_eq!(&input[range_u32_to_usize(*range)], r#"{"deep":1}"#)
+            }
             other => panic!("expected Object, got {other:?}"),
         }
         // Literal is whitespace-sensitive.
@@ -460,7 +469,7 @@ mod tests {
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
             CaptureValue::String(UnescapedString::Borrowed(range)) => {
-                assert_eq!(&input[*range], "plain");
+                assert_eq!(&input[range_u32_to_usize(*range)], "plain");
             }
             other => panic!("expected Borrowed, got {other:?}"),
         }
@@ -515,7 +524,7 @@ mod tests {
             .capture(captures[&(0, 0, Some("word".to_owned()))])
         {
             CaptureValue::PredicateCapture(UnescapedString::Borrowed(range)) => {
-                assert_eq!(&input[*range], "hello");
+                assert_eq!(&input[range_u32_to_usize(*range)], "hello");
             }
             other => panic!("expected Borrowed predicate capture, got {other:?}"),
         }
@@ -712,7 +721,9 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::Object(range) => assert_eq!(&input[*range], r#"{"k":1}"#),
+            CaptureValue::Object(range) => {
+                assert_eq!(&input[range_u32_to_usize(*range)], r#"{"k":1}"#)
+            }
             other => panic!("expected Object, got {other:?}"),
         }
     }
@@ -754,10 +765,8 @@ mod tests {
             Err(MatchError::TrailingData { pos: 3 })
         ));
         assert!(matches!(run(&machine, ""), Err(MatchError::UnexpectedEof)));
-        // An invalid escape is only detected when the value actually gets
-        // unescaped, i.e. when it is captured or fed to a predicate.
-        let capturing = [field(&[Key("a")], FieldType::Any, None, true)];
-        let (machine, _) = compile(&[&capturing]);
+        // The whole input is validated, so bad escapes error even in values
+        // that are never captured or unescaped.
         assert!(matches!(
             run(&machine, r#"{"a":"\q"}"#),
             Err(MatchError::InvalidEscape { .. })
@@ -766,6 +775,71 @@ mod tests {
             run(&machine, r#"{"a":"\ud83d oops"}"#),
             Err(MatchError::InvalidEscape { .. })
         ));
+    }
+
+    #[test]
+    fn skipped_regions_are_validated() {
+        // "a" is the only pattern path; everything else is skipped — and still
+        // must be JSON-compliant.
+        let fields = [field(&[Key("a")], FieldType::Any, None, false)];
+        let (machine, _) = compile(&[&fields]);
+        for bad in [
+            r#"{"noise":01,"a":1}"#,         // leading zero
+            r#"{"noise":1.,"a":1}"#,         // bare decimal point
+            r#"{"noise":1e,"a":1}"#,         // missing exponent digits
+            r#"{"noise":+1,"a":1}"#,         // leading plus
+            r#"{"noise":--1,"a":1}"#,        // double sign
+            r#"{"noise":[1,2},"a":1}"#,      // bracket mismatch
+            r#"{"noise":{"x"},"a":1}"#,      // missing colon
+            r#"{"noise":[1,],"a":1}"#,       // trailing comma
+            r#"{"noise":{"x":},"a":1}"#,     // missing member value
+            r#"{"noise":"\q","a":1}"#,       // bad escape in skipped string
+            r#"{"noise":"\udc00","a":1}"#,   // lone low surrogate
+            "{\"noise\":\"\u{1}\",\"a\":1}", // raw control character
+            r#"{"noise":[nul],"a":1}"#,      // bad keyword
+        ] {
+            assert!(run(&machine, bad).is_err(), "should error: {bad}");
+        }
+        for good in [
+            r#"{"noise":[1,-0.5e+10,{"x":[[]],"y":"A"},true],"a":1}"#,
+            r#"{"noise":0.125,"a":1}"#,
+            r#"{"noise":-0,"a":1}"#,
+        ] {
+            assert!(
+                run(&machine, good).unwrap().result.did_match(0),
+                "should match: {good}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_limit() {
+        let fields = [field(&[Key("a")], FieldType::Any, None, false)];
+        let (machine, _) = compile(&[&fields]);
+        let deep = |n: usize| format!("{}0{}", "[".repeat(n), "]".repeat(n));
+
+        let mut state = machine.allocate_state();
+        assert_eq!(state.depth_limit(), DEFAULT_DEPTH_LIMIT);
+        machine.match_string(&deep(128), &mut state).unwrap();
+        assert!(matches!(
+            machine.match_string(&deep(129), &mut state),
+            Err(MatchError::DepthLimitExceeded { .. })
+        ));
+
+        state.set_depth_limit(4);
+        machine.match_string(&deep(4), &mut state).unwrap();
+        assert!(matches!(
+            machine.match_string(&deep(5), &mut state),
+            Err(MatchError::DepthLimitExceeded { .. })
+        ));
+        // Deep nesting inside a skipped member is limited the same way.
+        assert!(matches!(
+            machine.match_string(&format!(r#"{{"noise":{},"a":1}}"#, deep(5)), &mut state),
+            Err(MatchError::DepthLimitExceeded { .. })
+        ));
+
+        state.set_depth_limit(300);
+        machine.match_string(&deep(300), &mut state).unwrap();
     }
 
     #[test]
@@ -893,7 +967,7 @@ mod tests {
                     (FieldType::Object, Some(expected)) => match capture {
                         CaptureValue::Object(range) => {
                             let reparsed: serde_json::Value =
-                                serde_json::from_str(&json[*range]).unwrap();
+                                serde_json::from_str(&json[range_u32_to_usize(*range)]).unwrap();
                             assert_eq!(&reparsed, expected);
                         }
                         other => panic!("expected Object, got {other:?}"),

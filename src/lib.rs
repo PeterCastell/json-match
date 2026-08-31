@@ -3,7 +3,7 @@
 use bitvec::{bitbox, boxed::BitBox, order::Lsb0};
 use compact_str::CompactString;
 use regex::{CaptureLocations, Regex};
-use std::range::Range;
+use std::{assert_matches, range::Range};
 
 pub mod testing;
 
@@ -48,8 +48,8 @@ pub enum FieldType {
 pub enum CaptureValue {
     NotCaptured,
     PredicateCapture(UnescapedString),
-    Object(Range<usize>),
-    Array(Range<usize>),
+    Object(Range<u32>),
+    Array(Range<u32>),
     String(UnescapedString),
     Number(f64),
     Bool(bool),
@@ -59,16 +59,32 @@ pub enum CaptureValue {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnescapedString {
     /// The value contained no escape sequences; the range indexes the original input.
-    Borrowed(Range<usize>),
+    Borrowed(Range<u32>),
     Owned(CompactString),
 }
 
 impl UnescapedString {
     pub fn resolve<'s>(&'s self, input: &'s str) -> &'s str {
         match self {
-            UnescapedString::Borrowed(range) => &input[*range],
+            UnescapedString::Borrowed(range) => &input[range_u32_to_usize(*range)],
             UnescapedString::Owned(string) => string,
         }
+    }
+}
+
+#[inline]
+pub fn range_u32_to_usize(range: Range<u32>) -> Range<usize> {
+    Range {
+        start: range.start as usize,
+        end: range.end as usize,
+    }
+}
+
+#[inline]
+fn range_u32(start: u32, end: u32) -> Range<u32> {
+    Range {
+        start: start,
+        end: end,
     }
 }
 
@@ -86,15 +102,17 @@ pub enum CompileError {}
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MatchError {
     #[error("unexpected byte 0x{byte:02x} at offset {pos}")]
-    UnexpectedByte { pos: usize, byte: u8 },
+    UnexpectedByte { pos: u32, byte: u8 },
     #[error("unexpected end of input")]
     UnexpectedEof,
     #[error("trailing data at offset {pos}")]
-    TrailingData { pos: usize },
+    TrailingData { pos: u32 },
     #[error("invalid number at offset {pos}")]
-    InvalidNumber { pos: usize },
+    InvalidNumber { pos: u32 },
     #[error("invalid string escape at offset {pos}")]
-    InvalidEscape { pos: usize },
+    InvalidEscape { pos: u32 },
+    #[error("nesting depth limit exceeded at offset {pos}")]
+    DepthLimitExceeded { pos: u32 },
 }
 
 #[derive(Clone)]
@@ -107,7 +125,7 @@ struct Action {
     /// Index into MachineState.capture_locs; u32::MAX when predicate is None.
     predicate_loc: u32,
     /// (regex group index, machine capture index) for named groups not starting with '_'.
-    predicate_groups: Box<[(usize, u32)]>,
+    predicate_groups: Box<[(u32, u32)]>,
     value_capture: Option<u32>,
 }
 
@@ -153,12 +171,29 @@ impl MachineResult {
     }
 }
 
+pub const DEFAULT_DEPTH_LIMIT: usize = 128;
+
 pub struct MachineState {
     pub result: MachineResult,
     satisfied: BitBox,
     set_counts: Box<[u32]>,
     capture_locs: Box<[CaptureLocations]>,
     unescape_buf: String,
+    /// One bit per open container while validating skipped regions
+    /// (1 = object, 0 = array); its length is the nesting depth limit.
+    bracket_stack: BitBox,
+}
+
+impl MachineState {
+    /// Maximum container nesting depth accepted while validating regions the
+    /// pattern does not descend into. Nesting along matched paths is bounded
+    /// by the compiled pattern instead and does not count against this limit.
+    pub fn depth_limit(&self) -> usize {
+        self.bracket_stack.len()
+    }
+    pub fn set_depth_limit(&mut self, limit: usize) {
+        self.bracket_stack = bitbox![usize, Lsb0; 0; limit];
+    }
 }
 
 #[derive(Default)]
@@ -289,6 +324,7 @@ impl MatchMachine {
             set_counts: vec![0u32; self.set_required_counts.len()].into_boxed_slice(),
             capture_locs: locs.into_iter().map(|slot| slot.unwrap()).collect(),
             unescape_buf: String::new(),
+            bracket_stack: bitbox![usize, Lsb0; 0; DEFAULT_DEPTH_LIMIT],
         }
     }
 
@@ -341,7 +377,7 @@ impl MatchMachine {
                                 capture_index_in_set: next_set_capture_index,
                                 capture_index_in_machine: next_machine_capture_index,
                             });
-                            predicate_groups.push((group_index, next_machine_capture_index));
+                            predicate_groups.push((group_index as u32, next_machine_capture_index));
                             next_machine_capture_index += 1;
                             next_set_capture_index += 1;
                         }
@@ -395,6 +431,9 @@ impl MatchMachine {
     }
 
     pub fn match_string(&self, string: &str, state: &mut MachineState) -> Result<(), MatchError> {
+        const MAX_STR_LEN: usize = u32::MAX as usize;
+        assert_matches!(string.len(), 0..MAX_STR_LEN);
+
         state.result.capture_values.fill(CaptureValue::NotCaptured);
         state.result.match_results.fill(false);
         state.satisfied.fill(false);
@@ -406,9 +445,9 @@ impl MatchMachine {
             bytes: string.as_bytes(),
         };
         let pos = matcher.skip_ws(0);
-        let end = matcher.process_value(pos, 0, state)?;
+        let end = matcher.process_value(pos as u32, 0, state)?;
         let end = matcher.skip_ws(end);
-        if end != matcher.bytes.len() {
+        if end != matcher.bytes.len() as u32 {
             return Err(MatchError::TrailingData { pos: end });
         }
 
@@ -429,8 +468,8 @@ struct Matcher<'m, 's> {
 }
 
 impl Matcher<'_, '_> {
-    fn skip_ws(&self, mut pos: usize) -> usize {
-        while let Some(&byte) = self.bytes.get(pos) {
+    fn skip_ws(&self, mut pos: u32) -> u32 {
+        while let Some(byte) = self.byte_at(pos) {
             match byte {
                 b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
                 _ => break,
@@ -439,11 +478,9 @@ impl Matcher<'_, '_> {
         pos
     }
 
-    fn peek(&self, pos: usize) -> Result<u8, MatchError> {
-        self.bytes
-            .get(pos)
-            .copied()
-            .ok_or(MatchError::UnexpectedEof)
+    #[inline]
+    fn peek(&self, pos: u32) -> Result<u8, MatchError> {
+        self.byte_at(pos).ok_or(MatchError::UnexpectedEof)
     }
 
     /// Scan one value starting at pos, descending only where the trie has
@@ -451,10 +488,10 @@ impl Matcher<'_, '_> {
     /// Returns the position just past the value.
     fn process_value(
         &self,
-        pos: usize,
+        pos: u32,
         node_index: u32,
         state: &mut MachineState,
-    ) -> Result<usize, MatchError> {
+    ) -> Result<u32, MatchError> {
         let node = &self.machine.nodes[node_index as usize];
         let first = self.peek(pos)?;
         let mut string_escaped = false;
@@ -464,24 +501,24 @@ impl Matcher<'_, '_> {
                 self.walk_array(pos, node, state)?
             }
             b'"' => {
-                let (end, escaped) = self.skip_string(pos)?;
+                let (end, escaped) = self.validate_string(pos)?;
                 string_escaped = escaped;
                 end
             }
-            _ => self.skip_value(pos)?,
+            _ => self.validate_value(pos, state)?,
         };
         if node.actions.start != node.actions.end {
-            self.run_actions(node, pos, end, string_escaped, state)?;
+            self.run_actions(node, range_u32(pos, end), string_escaped, state)?;
         }
         Ok(end)
     }
 
     fn walk_object(
         &self,
-        pos: usize,
+        pos: u32,
         node: &Node,
         state: &mut MachineState,
-    ) -> Result<usize, MatchError> {
+    ) -> Result<u32, MatchError> {
         let mut pos = self.skip_ws(pos + 1);
         if self.peek(pos)? == b'}' {
             return Ok(pos + 1);
@@ -492,8 +529,13 @@ impl Matcher<'_, '_> {
                 return Err(MatchError::UnexpectedByte { pos, byte });
             }
             let key_start = pos;
-            let (key_end, key_escaped) = self.skip_string(pos)?;
-            let child = self.lookup_key(node, key_start + 1, key_end - 1, key_escaped, state)?;
+            let (key_end, key_escaped) = self.validate_string(pos)?;
+            let child = self.lookup_key(
+                node,
+                range_u32(key_start + 1, key_end - 1),
+                key_escaped,
+                state,
+            )?;
             pos = self.skip_ws(key_end);
             let byte = self.peek(pos)?;
             if byte != b':' {
@@ -502,7 +544,7 @@ impl Matcher<'_, '_> {
             pos = self.skip_ws(pos + 1);
             pos = match child {
                 Some(child) => self.process_value(pos, child, state)?,
-                None => self.skip_value(pos)?,
+                None => self.validate_value(pos, state)?,
             };
             pos = self.skip_ws(pos);
             match self.peek(pos)? {
@@ -516,13 +558,12 @@ impl Matcher<'_, '_> {
     fn lookup_key(
         &self,
         node: &Node,
-        content_start: usize,
-        content_end: usize,
+        content: Range<u32>,
         escaped: bool,
         state: &mut MachineState,
     ) -> Result<Option<u32>, MatchError> {
         if !escaped {
-            let raw = &self.bytes[content_start..content_end];
+            let raw = &self.bytes[range_u32_to_usize(content)];
             for (key, child) in &node.key_children {
                 if key.as_bytes() == raw {
                     return Ok(Some(*child));
@@ -531,12 +572,9 @@ impl Matcher<'_, '_> {
         } else {
             state.unescape_buf.clear();
             unescape_into(
-                &self.input[Range {
-                    start: content_start,
-                    end: content_end,
-                }],
+                &self.input[range_u32_to_usize(content)],
                 &mut state.unescape_buf,
-                content_start,
+                content.start,
             )?;
             for (key, child) in &node.key_children {
                 if key.as_str() == state.unescape_buf {
@@ -549,10 +587,10 @@ impl Matcher<'_, '_> {
 
     fn walk_array(
         &self,
-        pos: usize,
+        pos: u32,
         node: &Node,
         state: &mut MachineState,
-    ) -> Result<usize, MatchError> {
+    ) -> Result<u32, MatchError> {
         let mut pos = self.skip_ws(pos + 1);
         if self.peek(pos)? == b']' {
             return Ok(pos + 1);
@@ -568,7 +606,7 @@ impl Matcher<'_, '_> {
             };
             pos = match child {
                 Some(child) => self.process_value(pos, child, state)?,
-                None => self.skip_value(pos)?,
+                None => self.validate_value(pos, state)?,
             };
             pos = self.skip_ws(pos);
             match self.peek(pos)? {
@@ -582,83 +620,192 @@ impl Matcher<'_, '_> {
         }
     }
 
-    /// Find the end of a value without interpreting it. Only shallowly
-    /// validates: bracket/string structure and keyword spelling, not numbers
-    /// or inner grammar.
-    fn skip_value(&self, pos: usize) -> Result<usize, MatchError> {
-        match self.peek(pos)? {
-            b'"' => Ok(self.skip_string(pos)?.0),
-            b'{' | b'[' => self.skip_container(pos),
-            b't' => self.expect_keyword(pos, b"true"),
-            b'f' => self.expect_keyword(pos, b"false"),
-            b'n' => self.expect_keyword(pos, b"null"),
-            b'-' | b'0'..=b'9' => Ok(self.skip_number(pos)),
-            byte => Err(MatchError::UnexpectedByte { pos, byte }),
+    /// Fully validate one JSON value starting at pos without interpreting it,
+    /// and return the position just past it. Container nesting is tracked in
+    /// the state's bracket stack; exceeding its length is an error, so the
+    /// stack length is the depth limit for regions the pattern skips.
+    fn validate_value(&self, pos: u32, state: &mut MachineState) -> Result<u32, MatchError> {
+        let limit = state.bracket_stack.len();
+        let mut depth = 0usize;
+        let mut i = pos;
+        'value: loop {
+            // A value is expected at i.
+            match self.peek(i)? {
+                byte @ (b'{' | b'[') => {
+                    if depth == limit {
+                        return Err(MatchError::DepthLimitExceeded { pos: i });
+                    }
+                    let is_object = byte == b'{';
+                    state.bracket_stack.set(depth, is_object);
+                    depth += 1;
+                    i = self.skip_ws(i + 1);
+                    if self.peek(i)? == (if is_object { b'}' } else { b']' }) {
+                        i += 1;
+                        depth -= 1;
+                    } else if is_object {
+                        i = self.validate_key_colon(i)?;
+                        continue 'value;
+                    } else {
+                        continue 'value;
+                    }
+                }
+                b'"' => i = self.validate_string(i)?.0,
+                b't' => i = self.expect_keyword(i, b"true")?,
+                b'f' => i = self.expect_keyword(i, b"false")?,
+                b'n' => i = self.expect_keyword(i, b"null")?,
+                b'-' | b'0'..=b'9' => i = self.validate_number(i)?,
+                byte => return Err(MatchError::UnexpectedByte { pos: i, byte }),
+            }
+            // A value just ended; close containers / consume separators.
+            loop {
+                if depth == 0 {
+                    return Ok(i);
+                }
+                i = self.skip_ws(i);
+                let is_object = state.bracket_stack[depth - 1];
+                match self.peek(i)? {
+                    b',' => {
+                        i = self.skip_ws(i + 1);
+                        if is_object {
+                            i = self.validate_key_colon(i)?;
+                        }
+                        continue 'value;
+                    }
+                    b'}' if is_object => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    b']' if !is_object => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    byte => return Err(MatchError::UnexpectedByte { pos: i, byte }),
+                }
+            }
         }
     }
 
-    fn expect_keyword(&self, pos: usize, keyword: &[u8]) -> Result<usize, MatchError> {
-        let end = pos + keyword.len();
-        if self.bytes.len() < end {
+    /// At a member key: validate the key string and the ':' separator, and
+    /// return the position of the member's value.
+    fn validate_key_colon(&self, pos: u32) -> Result<u32, MatchError> {
+        let byte = self.peek(pos)?;
+        if byte != b'"' {
+            return Err(MatchError::UnexpectedByte { pos, byte });
+        }
+        let (end, _) = self.validate_string(pos)?;
+        let pos = self.skip_ws(end);
+        let byte = self.peek(pos)?;
+        if byte != b':' {
+            return Err(MatchError::UnexpectedByte { pos, byte });
+        }
+        Ok(self.skip_ws(pos + 1))
+    }
+
+    fn expect_keyword(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
+        let end = pos + keyword.len() as u32;
+        if (self.bytes.len() as u32) < end {
             return Err(MatchError::UnexpectedEof);
         }
-        if &self.bytes[pos..end] == keyword {
+        if &self.bytes[pos as usize..end as usize] == keyword {
             Ok(end)
         } else {
             Err(MatchError::UnexpectedByte {
                 pos,
-                byte: self.bytes[pos],
+                byte: self.bytes[pos as usize],
             })
         }
     }
 
-    fn skip_number(&self, mut pos: usize) -> usize {
-        while let Some(&byte) = self.bytes.get(pos) {
-            match byte {
-                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => pos += 1,
-                _ => break,
-            }
-        }
-        pos
+    #[inline]
+    fn byte_at(&self, pos: u32) -> Option<u8> {
+        self.bytes.get(pos as usize).copied()
     }
 
-    /// pos is at the opening quote. Returns (position past the closing quote,
+    /// Strict JSON number grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+    fn validate_number(&self, pos: u32) -> Result<u32, MatchError> {
+        let mut i = pos;
+        if self.byte_at(i) == Some(b'-') {
+            i += 1;
+        }
+        match self.byte_at(i) {
+            Some(b'0') => i += 1,
+            Some(b'1'..=b'9') => {
+                i += 1;
+                while let Some(b'0'..=b'9') = self.byte_at(i) {
+                    i += 1;
+                }
+            }
+            _ => return Err(MatchError::InvalidNumber { pos }),
+        }
+        if self.byte_at(i) == Some(b'.') {
+            i += 1;
+            let digits = i;
+            while let Some(b'0'..=b'9') = self.byte_at(i) {
+                i += 1;
+            }
+            if i == digits {
+                return Err(MatchError::InvalidNumber { pos });
+            }
+        }
+        if let Some(b'e' | b'E') = self.byte_at(i) {
+            i += 1;
+            if let Some(b'+' | b'-') = self.byte_at(i) {
+                i += 1;
+            }
+            let digits = i;
+            while let Some(b'0'..=b'9') = self.byte_at(i) {
+                i += 1;
+            }
+            if i == digits {
+                return Err(MatchError::InvalidNumber { pos });
+            }
+        }
+        Ok(i)
+    }
+
+    /// pos is at the opening quote. Fully validates the string content: escape
+    /// syntax (including surrogate pairing, matching `unescape_into`) and no
+    /// raw control characters. Returns (position past the closing quote,
     /// whether the content contains escape sequences).
-    fn skip_string(&self, pos: usize) -> Result<(usize, bool), MatchError> {
+    fn validate_string(&self, pos: u32) -> Result<(u32, bool), MatchError> {
         let mut i = pos + 1;
         let mut escaped = false;
         loop {
-            match self.bytes.get(i) {
-                None => return Err(MatchError::UnexpectedEof),
-                Some(b'"') => return Ok((i + 1, escaped)),
-                Some(b'\\') => {
+            let byte = self.peek(i)?;
+            match byte {
+                b'"' => return Ok((i + 1, escaped)),
+                b'\\' => {
                     escaped = true;
+                    let escape_pos = i;
+                    let code = self.peek(i + 1)?;
                     i += 2;
-                }
-                Some(_) => i += 1,
-            }
-        }
-    }
-
-    fn skip_container(&self, pos: usize) -> Result<usize, MatchError> {
-        let mut depth = 0usize;
-        let mut i = pos;
-        loop {
-            match self.bytes.get(i) {
-                None => return Err(MatchError::UnexpectedEof),
-                Some(b'"') => i = self.skip_string(i)?.0,
-                Some(b'{' | b'[') => {
-                    depth += 1;
-                    i += 1;
-                }
-                Some(b'}' | b']') => {
-                    depth -= 1;
-                    i += 1;
-                    if depth == 0 {
-                        return Ok(i);
+                    match code {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => {
+                            let unit = parse_hex4(self.bytes, i)
+                                .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
+                            i += 4;
+                            if (0xD800..=0xDBFF).contains(&unit) {
+                                if self.byte_at(i) != Some(b'\\')
+                                    || self.byte_at(i + 1) != Some(b'u')
+                                {
+                                    return Err(MatchError::InvalidEscape { pos: escape_pos });
+                                }
+                                let low = parse_hex4(self.bytes, i + 2)
+                                    .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(MatchError::InvalidEscape { pos: escape_pos });
+                                }
+                                i += 6;
+                            } else if (0xDC00..=0xDFFF).contains(&unit) {
+                                return Err(MatchError::InvalidEscape { pos: escape_pos });
+                            }
+                        }
+                        _ => return Err(MatchError::InvalidEscape { pos: escape_pos }),
                     }
                 }
-                Some(_) => i += 1,
+                0x00..=0x1F => return Err(MatchError::UnexpectedByte { pos: i, byte }),
+                _ => i += 1,
             }
         }
     }
@@ -666,16 +813,12 @@ impl Matcher<'_, '_> {
     fn run_actions(
         &self,
         node: &Node,
-        start: usize,
-        end: usize,
+        range: Range<u32>,
         string_escaped: bool,
         state: &mut MachineState,
     ) -> Result<(), MatchError> {
-        let actions = &self.machine.actions[Range {
-            start: node.actions.start as usize,
-            end: node.actions.end as usize,
-        }];
-        let first = self.bytes[start];
+        let actions = &self.machine.actions[range_u32_to_usize(node.actions)];
+        let first = self.bytes[range.start as usize];
         // Whether unescape_buf currently holds this value's unescaped content.
         let mut buf_ready = false;
         for action in actions {
@@ -689,7 +832,9 @@ impl Matcher<'_, '_> {
                 FieldType::Number => matches!(first, b'-' | b'0'..=b'9'),
                 FieldType::Bool => matches!(first, b't' | b'f'),
                 FieldType::Null => first == b'n',
-                FieldType::Literal(literal) => literal.as_bytes() == &self.bytes[start..end],
+                FieldType::Literal(literal) => {
+                    literal.as_bytes() == &self.bytes[range_u32_to_usize(range)]
+                }
                 FieldType::Any => true,
             };
             if !type_ok {
@@ -701,29 +846,33 @@ impl Matcher<'_, '_> {
                 // unescaped content, for everything else the raw span.
                 let content = if first == b'"' {
                     Range {
-                        start: start + 1,
-                        end: end - 1,
+                        start: range.start + 1,
+                        end: range.end - 1,
                     }
                 } else {
-                    Range { start, end }
+                    range
                 };
                 let use_buf = first == b'"' && string_escaped;
                 if use_buf && !buf_ready {
                     state.unescape_buf.clear();
-                    unescape_into(&self.input[content], &mut state.unescape_buf, content.start)?;
+                    unescape_into(
+                        &self.input[range_u32_to_usize(content)],
+                        &mut state.unescape_buf,
+                        content.start,
+                    )?;
                     buf_ready = true;
                 }
                 let haystack: &str = if use_buf {
                     &state.unescape_buf
                 } else {
-                    &self.input[content]
+                    &self.input[range_u32_to_usize(content)]
                 };
                 let locs = &mut state.capture_locs[action.predicate_loc as usize];
                 if predicate.captures_read(locs, haystack).is_none() {
                     continue;
                 }
                 for &(group_index, capture_index) in &action.predicate_groups {
-                    let value = match locs.get(group_index) {
+                    let value = match locs.get(group_index as usize) {
                         Some((group_start, group_end)) => {
                             CaptureValue::PredicateCapture(if use_buf {
                                 UnescapedString::Owned(CompactString::from(
@@ -731,8 +880,8 @@ impl Matcher<'_, '_> {
                                 ))
                             } else {
                                 UnescapedString::Borrowed(Range {
-                                    start: content.start + group_start,
-                                    end: content.start + group_end,
+                                    start: content.start + group_start as u32,
+                                    end: content.start + group_end as u32,
                                 })
                             })
                         }
@@ -747,7 +896,7 @@ impl Matcher<'_, '_> {
 
             if let Some(capture_index) = action.value_capture {
                 let value =
-                    self.build_capture(first, start, end, string_escaped, &mut buf_ready, state)?;
+                    self.build_capture(first, range, string_escaped, &mut buf_ready, state)?;
                 state.result.capture_values[capture_index as usize] = value;
             }
         }
@@ -757,19 +906,18 @@ impl Matcher<'_, '_> {
     fn build_capture(
         &self,
         first: u8,
-        start: usize,
-        end: usize,
+        range: Range<u32>,
         string_escaped: bool,
         buf_ready: &mut bool,
         state: &mut MachineState,
     ) -> Result<CaptureValue, MatchError> {
         Ok(match first {
-            b'{' => CaptureValue::Object(Range { start, end }),
-            b'[' => CaptureValue::Array(Range { start, end }),
+            b'{' => CaptureValue::Object(range),
+            b'[' => CaptureValue::Array(range),
             b'"' => {
                 let content = Range {
-                    start: start + 1,
-                    end: end - 1,
+                    start: range.start + 1,
+                    end: range.end - 1,
                 };
                 if !string_escaped {
                     CaptureValue::String(UnescapedString::Borrowed(content))
@@ -777,7 +925,7 @@ impl Matcher<'_, '_> {
                     if !*buf_ready {
                         state.unescape_buf.clear();
                         unescape_into(
-                            &self.input[content],
+                            &self.input[range_u32_to_usize(content)],
                             &mut state.unescape_buf,
                             content.start,
                         )?;
@@ -792,29 +940,29 @@ impl Matcher<'_, '_> {
             b'f' => CaptureValue::Bool(false),
             b'n' => CaptureValue::Null,
             _ => {
-                let text = &self.input[Range { start, end }];
+                let text = &self.input[range_u32_to_usize(range)];
                 match text.parse::<f64>() {
                     Ok(number) => CaptureValue::Number(number),
-                    Err(_) => return Err(MatchError::InvalidNumber { pos: start }),
+                    Err(_) => return Err(MatchError::InvalidNumber { pos: range.start }),
                 }
             }
         })
     }
 }
 
-fn unescape_into(raw: &str, out: &mut String, base_pos: usize) -> Result<(), MatchError> {
+fn unescape_into(raw: &str, out: &mut String, base_pos: u32) -> Result<(), MatchError> {
     let bytes = raw.as_bytes();
     let mut chunk_start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
+    let mut i: u32 = 0;
+    while i < bytes.len() as u32 {
+        if bytes[i as usize] != b'\\' {
             i += 1;
             continue;
         }
-        out.push_str(&raw[chunk_start..i]);
+        out.push_str(&raw[chunk_start as usize..i as usize]);
         let escape_pos = base_pos + i;
         let code = *bytes
-            .get(i + 1)
+            .get(i as usize + 1)
             .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
         i += 2;
         match code {
@@ -831,7 +979,9 @@ fn unescape_into(raw: &str, out: &mut String, base_pos: usize) -> Result<(), Mat
                     parse_hex4(bytes, i).ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
                 i += 4;
                 let ch = if (0xD800..=0xDBFF).contains(&unit) {
-                    if bytes.get(i) != Some(&b'\\') || bytes.get(i + 1) != Some(&b'u') {
+                    if bytes.get(i as usize) != Some(&b'\\')
+                        || bytes.get(i as usize + 1) != Some(&b'u')
+                    {
                         return Err(MatchError::InvalidEscape { pos: escape_pos });
                     }
                     let low = parse_hex4(bytes, i + 2)
@@ -853,16 +1003,14 @@ fn unescape_into(raw: &str, out: &mut String, base_pos: usize) -> Result<(), Mat
         }
         chunk_start = i;
     }
-    out.push_str(&raw[chunk_start..]);
+    out.push_str(&raw[chunk_start as usize..]);
     Ok(())
 }
 
-fn parse_hex4(bytes: &[u8], pos: usize) -> Option<u16> {
-    if bytes.len() < pos + 4 {
-        return None;
-    }
+fn parse_hex4(bytes: &[u8], pos: u32) -> Option<u16> {
+    let bytes = bytes.get(pos as usize..pos as usize + 4)?;
     let mut value: u16 = 0;
-    for &byte in &bytes[pos..pos + 4] {
+    for &byte in bytes {
         let digit = match byte {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
