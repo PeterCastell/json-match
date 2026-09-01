@@ -140,7 +140,7 @@ pub enum MatchError {
 // level: the enum is small enough that a call's register clobbers in the hot
 // loops cost more than the never-taken inline writes.
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Action {
     set_index: u32,
     /// Global field id across all sets; indexes MachineState.satisfied.
@@ -164,12 +164,14 @@ impl NodeId {
     }
 }
 
-#[derive(Clone, Copy, Soars, soa_rs::SoaClone)]
+#[derive(Debug, Clone, Copy, Soars, soa_rs::SoaClone)]
+#[soa_derive(Debug)]
 struct IndexChild {
     index: u16,
     child: NodeId,
 }
 
+#[derive(Debug)]
 struct Node {
     key_children: Box<[(CompactString, NodeId)]>,
     /// Sorted by index. When a node also has a wildcard child, each fixed-index
@@ -180,6 +182,7 @@ struct Node {
     actions: Range<u32>,
 }
 
+#[derive(Debug)]
 pub struct MatchMachine {
     captures_length: u32,
     fields_length: u32,
@@ -189,6 +192,7 @@ pub struct MatchMachine {
     actions: Box<[Action]>,
 }
 
+#[derive(Debug)]
 pub struct MachineResult {
     capture_values: Box<[Option<CaptureValue>]>,
     match_results: BitBox, // whether each set by index matched
@@ -218,6 +222,7 @@ impl MachineResult {
 
 pub const DEFAULT_DEPTH_LIMIT: usize = 128;
 
+#[derive(Debug)]
 pub struct MachineState {
     pub result: MachineResult,
     satisfied: BitBox,
