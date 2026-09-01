@@ -400,8 +400,8 @@ mod tests {
         let state = run(&machine, r#"{"x":1,"a":{"y":[3],"b":true},"z":null}"#).unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Bool(true)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Bool(true))
         );
     }
 
@@ -428,30 +428,32 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::Object(range) => {
+            Some(CaptureValue::Object(range)) => {
                 assert_eq!(&input[range_u32_to_usize(*range)], r#"{"k":1}"#)
             }
             other => panic!("expected Object, got {other:?}"),
         }
         match state.result.capture(captures[&(0, 1, None)]) {
-            CaptureValue::Array(range) => assert_eq!(&input[range_u32_to_usize(*range)], "[1,2]"),
+            Some(CaptureValue::Array(range)) => {
+                assert_eq!(&input[range_u32_to_usize(*range)], "[1,2]")
+            }
             other => panic!("expected Array, got {other:?}"),
         }
         match state.result.capture(captures[&(0, 2, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "hi"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "hi"),
             other => panic!("expected String, got {other:?}"),
         }
         assert_matches!(
-            *state.result.capture(captures[&(0, 3, None)]),
-            CaptureValue::Number(-1250.0)
+            state.result.capture(captures[&(0, 3, None)]),
+            Some(CaptureValue::Number(-1250.0))
         );
         assert_matches!(
-            *state.result.capture(captures[&(0, 4, None)]),
-            CaptureValue::Bool(false)
+            state.result.capture(captures[&(0, 4, None)]),
+            Some(CaptureValue::Bool(false))
         );
         assert_matches!(
-            *state.result.capture(captures[&(0, 5, None)]),
-            CaptureValue::Null
+            state.result.capture(captures[&(0, 5, None)]),
+            Some(CaptureValue::Null)
         );
     }
 
@@ -471,7 +473,7 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 1, None)]) {
-            CaptureValue::Object(range) => {
+            Some(CaptureValue::Object(range)) => {
                 assert_eq!(&input[range_u32_to_usize(*range)], r#"{"deep":1}"#)
             }
             other => panic!("expected Object, got {other:?}"),
@@ -488,7 +490,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(UnescapedString::Borrowed(range)) => {
+            Some(CaptureValue::String(UnescapedString::Borrowed(range))) => {
                 assert_eq!(&input[range_u32_to_usize(*range)], "plain");
             }
             other => panic!("expected Borrowed, got {other:?}"),
@@ -502,7 +504,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s @ UnescapedString::Owned(_)) => {
+            Some(CaptureValue::String(s @ UnescapedString::Owned(_))) => {
                 assert_eq!(s.resolve(input), "line1\nline2 A 😀 \\");
             }
             other => panic!("expected Owned, got {other:?}"),
@@ -516,8 +518,8 @@ mod tests {
         let state = run(&machine, r#"{"a\nb":7}"#).unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Number(7.0)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Number(7.0))
         );
         // \u escape spelling of a key must also resolve.
         let fields = [field(vec![key("A")], FieldType::Number, None, false)];
@@ -543,7 +545,7 @@ mod tests {
             .result
             .capture(captures[&(0, 0, Some("word".to_owned()))])
         {
-            CaptureValue::PredicateCapture(UnescapedString::Borrowed(range)) => {
+            Some(CaptureValue::PredicateCapture(UnescapedString::Borrowed(range))) => {
                 assert_eq!(&input[range_u32_to_usize(*range)], "hello");
             }
             other => panic!("expected Borrowed predicate capture, got {other:?}"),
@@ -570,7 +572,7 @@ mod tests {
             .result
             .capture(captures[&(0, 0, Some("tail".to_owned()))])
         {
-            CaptureValue::PredicateCapture(s @ UnescapedString::Owned(_)) => {
+            Some(CaptureValue::PredicateCapture(s @ UnescapedString::Owned(_))) => {
                 assert_eq!(s.resolve(input), "y");
             }
             other => panic!("expected Owned predicate capture, got {other:?}"),
@@ -628,14 +630,14 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "y"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "y"),
             other => panic!("expected String, got {other:?}"),
         }
         // Both satisfy: the first one provides the capture.
         let input = r#"{"a":"y1","a":"z2"}"#;
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "y1"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "y1"),
             other => panic!("expected String, got {other:?}"),
         }
     }
@@ -652,8 +654,8 @@ mod tests {
         let state = run(&machine, r#"{"a":[10,42,99]}"#).unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Number(42.0)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Number(42.0))
         );
         assert!(!run(&machine, r#"{"a":[10]}"#).unwrap().result.did_match(0));
         assert!(
@@ -677,7 +679,7 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "bb"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "bb"),
             other => panic!("expected String, got {other:?}"),
         }
     }
@@ -694,8 +696,8 @@ mod tests {
         let state = run(&machine, r#"{"a":[1,"s",{"other":0},{"id":5}]}"#).unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Number(5.0)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Number(5.0))
         );
     }
 
@@ -711,8 +713,8 @@ mod tests {
         let state = run(&machine, r#"{"a":[["x"],[null,7]]}"#).unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Number(7.0)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Number(7.0))
         );
     }
 
@@ -730,7 +732,7 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 1, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "s"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "s"),
             other => panic!("expected String, got {other:?}"),
         }
     }
@@ -756,7 +758,7 @@ mod tests {
         let state = run(&machine, input).unwrap();
         assert!(state.result.did_match(0));
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::Object(range) => {
+            Some(CaptureValue::Object(range)) => {
                 assert_eq!(&input[range_u32_to_usize(*range)], r#"{"k":1}"#)
             }
             other => panic!("expected Object, got {other:?}"),
@@ -770,8 +772,8 @@ mod tests {
         let state = run(&machine, "[1, 2]").unwrap();
         assert!(state.result.did_match(0));
         assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::Number(2.0)
+            state.result.capture(captures[&(0, 0, None)]),
+            Some(CaptureValue::Number(2.0))
         );
     }
 
@@ -921,7 +923,7 @@ mod tests {
         // Escaped NUL is legal JSON.
         let state = run(&machine, r#"{"v":"\u0000x"}"#).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(r#"{"v":"\u0000x"}"#), "\0x"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(r#"{"v":"\u0000x"}"#), "\0x"),
             other => panic!("expected String, got {other:?}"),
         }
         // Raw DEL (0x7F) is legal; only 0x00..=0x1F are rejected unescaped.
@@ -947,7 +949,7 @@ mod tests {
         let (machine, captures) = compile(&[&fields]);
         let state = run(&machine, input).unwrap();
         match state.result.capture(captures[&(0, 0, None)]) {
-            CaptureValue::String(s) => assert_eq!(s.resolve(input), "A😀"),
+            Some(CaptureValue::String(s)) => assert_eq!(s.resolve(input), "A😀"),
             other => panic!("expected String, got {other:?}"),
         }
     }
@@ -974,10 +976,7 @@ mod tests {
         assert!(state.result.did_match(0));
         machine.match_string(r#"{"b":1}"#, &mut state).unwrap();
         assert!(!state.result.did_match(0));
-        assert_matches!(
-            *state.result.capture(captures[&(0, 0, None)]),
-            CaptureValue::NotCaptured
-        );
+        assert_matches!(state.result.capture(captures[&(0, 0, None)]), None);
     }
 
     #[test]
@@ -1051,16 +1050,16 @@ mod tests {
                 }
                 match (&field.r#type, value) {
                     (FieldType::String, Some(expected)) => match capture {
-                        CaptureValue::String(s) => {
+                        Some(CaptureValue::String(s)) => {
                             assert_eq!(s.resolve(&json), expected.as_str().unwrap());
                         }
                         other => panic!("expected String, got {other:?}"),
                     },
                     (FieldType::Bool, Some(expected)) => {
-                        assert_matches!(*capture, CaptureValue::Bool(b) if b == expected.as_bool().unwrap());
+                        assert_matches!(capture, Some(&CaptureValue::Bool(b)) if b == expected.as_bool().unwrap());
                     }
                     (FieldType::Object, Some(expected)) => match capture {
-                        CaptureValue::Object(range) => {
+                        Some(CaptureValue::Object(range)) => {
                             let reparsed: serde_json::Value =
                                 serde_json::from_str(&json[range_u32_to_usize(*range)]).unwrap();
                             assert_eq!(&reparsed, expected);
@@ -1069,7 +1068,7 @@ mod tests {
                     },
                     (FieldType::Number, None) => {
                         // AnyIndex path: just require that a number was captured.
-                        assert!(matches!(capture, CaptureValue::Number(_)));
+                        assert!(matches!(capture, Some(CaptureValue::Number(_))));
                     }
                     (ty, value) => {
                         panic!("unhandled oracle case: {ty:?} vs {value:?}");

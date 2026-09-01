@@ -58,7 +58,6 @@ pub enum FieldType {
 
 #[derive(Debug, Clone)]
 pub enum CaptureValue {
-    NotCaptured,
     PredicateCapture(UnescapedString),
     Object(Range<u32>),
     Array(Range<u32>),
@@ -191,7 +190,7 @@ pub struct MatchMachine {
 }
 
 pub struct MachineResult {
-    capture_values: Box<[CaptureValue]>,
+    capture_values: Box<[Option<CaptureValue>]>,
     match_results: BitBox, // whether each set by index matched
 }
 
@@ -199,16 +198,20 @@ impl MachineResult {
     pub fn did_match(&self, set_index: u32) -> bool {
         self.match_results[set_index as usize]
     }
+
     pub fn match_results(&self) -> &BitBox {
         &self.match_results
     }
+
     pub fn matches(&self) -> impl Iterator<Item = u32> {
         self.match_results.iter_ones().map(|i| i as u32)
     }
-    pub fn capture(&self, machine_capture_index: u32) -> &CaptureValue {
-        &self.capture_values[machine_capture_index as usize]
+
+    pub fn capture(&self, machine_capture_index: u32) -> Option<&CaptureValue> {
+        self.capture_values[machine_capture_index as usize].as_ref()
     }
-    pub fn captures(&self) -> &[CaptureValue] {
+
+    pub fn captures(&self) -> &[Option<CaptureValue>] {
         &self.capture_values
     }
 }
@@ -372,8 +375,7 @@ impl MatchMachine {
         }
         MachineState {
             result: MachineResult {
-                capture_values: vec![CaptureValue::NotCaptured; self.captures_length as usize]
-                    .into_boxed_slice(),
+                capture_values: vec![None; self.captures_length as usize].into_boxed_slice(),
                 match_results: bitbox![usize, Lsb0; 0; self.set_required_counts.len()],
             },
             satisfied: bitbox![usize, Lsb0; 0; self.fields_length as usize],
@@ -492,7 +494,7 @@ impl MatchMachine {
             return Err(MatchError::InputTooLong { len: string.len() });
         }
 
-        state.result.capture_values.fill(CaptureValue::NotCaptured);
+        state.result.capture_values.fill_with(|| None);
         state.result.match_results.fill(false);
         state.satisfied.fill(false);
         state.set_counts.fill(0);
@@ -830,7 +832,10 @@ impl Matcher<'_, '_> {
         if bytes == keyword {
             Ok(end as u32)
         } else {
-            Err(MatchError::UnexpectedByte { pos, byte: self.bytes[pos as usize] })
+            Err(MatchError::UnexpectedByte {
+                pos,
+                byte: self.bytes[pos as usize],
+            })
         }
     }
 
@@ -1004,8 +1009,9 @@ impl Matcher<'_, '_> {
                     continue;
                 }
                 for &(group_index, capture_index) in &action.predicate_groups {
-                    let value = match locs.get(group_index as usize) {
-                        Some((group_start, group_end)) => {
+                    let value = locs
+                        .get(group_index as usize)
+                        .map(|(group_start, group_end)| {
                             CaptureValue::PredicateCapture(if use_buf {
                                 UnescapedString::Owned(CompactString::from(
                                     &state.unescape_buf[group_start..group_end],
@@ -1016,9 +1022,7 @@ impl Matcher<'_, '_> {
                                     end: content.start + group_end as u32,
                                 })
                             })
-                        }
-                        None => CaptureValue::NotCaptured,
-                    };
+                        });
                     state.result.capture_values[capture_index as usize] = value;
                 }
             }
@@ -1029,7 +1033,7 @@ impl Matcher<'_, '_> {
             if let Some(capture_index) = action.value_capture {
                 let value =
                     self.build_capture(first, range, string_escaped, &mut buf_ready, state)?;
-                state.result.capture_values[capture_index as usize] = value;
+                state.result.capture_values[capture_index as usize] = Some(value);
             }
         }
         Ok(())
