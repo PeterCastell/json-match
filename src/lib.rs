@@ -111,10 +111,10 @@ pub struct CaptureCallbackArgs<'a> {
     pub capture_index_in_machine: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CompileError {}
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum MatchError {
     #[error("unexpected byte 0x{byte:02x} at offset {pos}")]
     UnexpectedByte { pos: u32, byte: u8 },
