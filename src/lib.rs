@@ -136,6 +136,10 @@ pub enum MatchError {
     #[error("nesting depth limit exceeded at offset {pos}")]
     DepthLimitExceeded { pos: u32 },
 }
+// NOTE: outlining error construction into #[cold] #[inline(never)] helper fns
+// was benchmarked and lost to inline construction by 1-5% at every bloat
+// level: the enum is small enough that a call's register clobbers in the hot
+// loops cost more than the never-taken inline writes.
 
 #[derive(Clone)]
 struct Action {
@@ -647,12 +651,13 @@ impl Matcher<'_, '_> {
         if self.peek(pos)? == b']' {
             return Ok(pos + 1);
         }
-        // TODO: mark likely()
+        // The <= 512 path is the likely one; walk_array_large is #[cold] so
+        // this branch is laid out and predicted accordingly.
         if node.index_children.len() <= 512 {
             for index in 0..=u16::MAX {
-                let child = match node.index_children.index().binary_search(&index) {
-                    Ok(found) => Some(node.index_children.child()[found]),
-                    Err(_) => node.any_index_child,
+                let child = match node.index_children.index().iter().position(|&i| i == index) {
+                    Some(found) => Some(node.index_children.child()[found]),
+                    None => node.any_index_child,
                 };
                 pos = match child {
                     Some(child) => self.process_value(pos, child, state)?,
@@ -671,6 +676,7 @@ impl Matcher<'_, '_> {
         }
     }
 
+    #[cold]
     fn walk_array_large(
         &self,
         mut pos: u32,
@@ -763,9 +769,9 @@ impl Matcher<'_, '_> {
                     }
                 }
                 b'"' => i = self.validate_string(i)?.0,
-                b't' => i = self.expect_keyword_suffix(i + 1, b"rue")?,
-                b'f' => i = self.expect_keyword_suffix(i + 1, b"alse")?,
-                b'n' => i = self.expect_keyword_suffix(i + 1, b"ull")?,
+                b't' => i = self.expect_keyword(i, b"true")?,
+                b'f' => i = self.expect_keyword(i, b"false")?,
+                b'n' => i = self.expect_keyword(i, b"null")?,
                 b'-' | b'0'..=b'9' => i = self.validate_number(i)?,
                 byte => return Err(MatchError::UnexpectedByte { pos: i, byte }),
             }
@@ -815,7 +821,7 @@ impl Matcher<'_, '_> {
     }
 
     #[inline]
-    fn expect_keyword_suffix(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
+    fn expect_keyword(&self, pos: u32, keyword: &[u8]) -> Result<u32, MatchError> {
         let end = (pos as usize) + keyword.len();
         let bytes = self
             .bytes
@@ -824,10 +830,7 @@ impl Matcher<'_, '_> {
         if bytes == keyword {
             Ok(end as u32)
         } else {
-            Err(MatchError::UnexpectedByte {
-                pos,
-                byte: self.bytes[pos as usize],
-            })
+            Err(MatchError::UnexpectedByte { pos, byte: self.bytes[pos as usize] })
         }
     }
 
@@ -896,38 +899,47 @@ impl Matcher<'_, '_> {
                 b'"' => return Ok((i + 1, escaped)),
                 b'\\' => {
                     escaped = true;
-                    let escape_pos = i;
-                    let code = self.peek(i + 1)?;
-                    i += 2;
-                    match code {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-                        b'u' => {
-                            let unit = parse_hex4(self.bytes, i)
-                                .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
-                            i += 4;
-                            if (0xD800..=0xDBFF).contains(&unit) {
-                                if self.byte_at(i) != Some(b'\\')
-                                    || self.byte_at(i + 1) != Some(b'u')
-                                {
-                                    return Err(MatchError::InvalidEscape { pos: escape_pos });
-                                }
-                                let low = parse_hex4(self.bytes, i + 2)
-                                    .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
-                                if !(0xDC00..=0xDFFF).contains(&low) {
-                                    return Err(MatchError::InvalidEscape { pos: escape_pos });
-                                }
-                                i += 6;
-                            } else if (0xDC00..=0xDFFF).contains(&unit) {
-                                return Err(MatchError::InvalidEscape { pos: escape_pos });
-                            }
-                        }
-                        _ => return Err(MatchError::InvalidEscape { pos: escape_pos }),
-                    }
+                    i = self.validate_escape(i)?;
                 }
                 0x00..=0x1F => return Err(MatchError::UnexpectedByte { pos: i, byte }),
                 _ => i += 1,
             }
         }
+    }
+
+    /// pos is at the backslash. Validates one escape sequence (including
+    /// surrogate pairing, matching `unescape_into`) and returns the position
+    /// just past it. Escapes are rare in typical input, so this is marked cold
+    /// to keep validate_string's byte loop small; escape-dense workloads pay
+    /// a call per escape.
+    #[cold]
+    fn validate_escape(&self, pos: u32) -> Result<u32, MatchError> {
+        let escape_pos = pos;
+        let code = self.peek(pos + 1)?;
+        let mut i = pos + 2;
+        match code {
+            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+            b'u' => {
+                let unit = parse_hex4(self.bytes, i)
+                    .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
+                i += 4;
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    if self.byte_at(i) != Some(b'\\') || self.byte_at(i + 1) != Some(b'u') {
+                        return Err(MatchError::InvalidEscape { pos: escape_pos });
+                    }
+                    let low = parse_hex4(self.bytes, i + 2)
+                        .ok_or(MatchError::InvalidEscape { pos: escape_pos })?;
+                    if !(0xDC00..=0xDFFF).contains(&low) {
+                        return Err(MatchError::InvalidEscape { pos: escape_pos });
+                    }
+                    i += 6;
+                } else if (0xDC00..=0xDFFF).contains(&unit) {
+                    return Err(MatchError::InvalidEscape { pos: escape_pos });
+                }
+            }
+            _ => return Err(MatchError::InvalidEscape { pos: escape_pos }),
+        }
+        Ok(i)
     }
 
     fn run_actions(
