@@ -2,9 +2,12 @@
 #![forbid(unsafe_code)]
 
 use std::range::Range;
+use std::sync::LazyLock;
+use std::{fmt, num::NonZero};
 
 use bitvec::{bitbox, boxed::BitBox, order::Lsb0};
 use compact_str::CompactString;
+use integer_encoding::VarInt;
 use regex::{CaptureLocations, Regex};
 use soa_rs::{Soa, Soars};
 
@@ -64,6 +67,37 @@ pub enum FieldType {
     Any,
 }
 
+fn usize_to_u24(x: usize) -> Option<(u16, u8)> {
+    if x > 0xFFFFFF {
+        None
+    } else {
+        Some((x as u16, (x >> 16) as u8))
+    }
+}
+
+fn u24_to_usize(lsb: u16, msb: u8) -> usize {
+    ((msb as usize) << 16) | (lsb as usize)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MachineFieldType {
+    Object,
+    Array,
+    String,
+    Number,
+    Bool,
+    Null,
+    /// Raw byte-for-byte comparison against the value's text, whitespace-sensitive.
+    /// Example: `Literal("[1,2,3]".into())`
+    Literal {
+        len: u32,
+        lsb: u16,
+        msb: u8,
+    },
+    /// Match any value, type is returned through CaptureValue.
+    Any,
+}
+
 #[derive(Debug, Clone)]
 pub enum CaptureValue {
     PredicateCapture(UnescapedString),
@@ -110,12 +144,59 @@ fn range_u32(start: u32, end: u32) -> Range<u32> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MachineCaptureIndex(NonZero<u32>);
+
+impl MachineCaptureIndex {
+    pub const fn new(index: u32) -> Option<Self> {
+        match NonZero::new(index + 1) {
+            Some(i) => Some(Self(i)),
+            None => None,
+        }
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
+impl fmt::Debug for MachineCaptureIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("MachineCaptureIndex")
+            .field(&self.get())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SetCaptureIndex(NonZero<u32>);
+
+impl SetCaptureIndex {
+    pub const fn new(index: u32) -> Option<Self> {
+        match NonZero::new(index + 1) {
+            Some(i) => Some(Self(i)),
+            None => None,
+        }
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
+impl fmt::Debug for SetCaptureIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SetCaptureIndex").field(&self.get()).finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureCallbackArgs<'a> {
     pub match_set_index: u32,
     pub field_index: u32,
     pub predicate_capture_name: Option<&'a str>,
-    pub capture_index_in_set: u32,
-    pub capture_index_in_machine: u32,
+    pub capture_index_in_set: SetCaptureIndex,
+    pub capture_index_in_machine: MachineCaptureIndex,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +207,10 @@ pub enum CompileError {
     /// surrounding whitespace, so a padded literal could never match.
     #[error("literal of field {field_index} in set {set_index} is not valid JSON")]
     InvalidLiteral { set_index: u32, field_index: u32 },
+    #[error(
+        "literal of field {field_index} in set {set_index} is greater than 2^32 bytes in length"
+    )]
+    LiteralTooLong { set_index: u32, field_index: u32 },
     /// A field's path descends another field whose declared type contradicts
     /// the descent: an Object descended with an index, an Array descended with
     /// a key, or a non-container type descended at all. `Any` accepts either
@@ -162,8 +247,14 @@ pub enum CompileError {
     },
     /// `exhaustive` set on a field whose type has no members to enumerate;
     /// only Object, Array, and Any support it.
-    #[error("field {field_index} in set {set_index} is exhaustive but its type does not support it")]
+    #[error(
+        "field {field_index} in set {set_index} is exhaustive but its type does not support it"
+    )]
     ExhaustiveUnsupportedType { set_index: u32, field_index: u32 },
+    #[error("the number of captures exceeds 2^32 - 1, which is an awful lot")]
+    TooManyCaptures,
+    #[error("the number of literals exceeds 2^24, which is an awful lot")]
+    TooManyLiterals,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -181,8 +272,8 @@ pub enum MatchError {
     /// validated syntactically without a range check.
     #[error("number out of f64 range at offset {pos}")]
     NumberOutOfRange { pos: u32 },
-    #[error("input length {len} exceeds u32::MAX bytes")]
-    InputTooLong { len: usize },
+    #[error("input length exceeds u32::MAX bytes")]
+    InputTooLong,
     #[error("invalid string escape at offset {pos}")]
     InvalidEscape { pos: u32 },
     #[error("nesting depth limit exceeded at offset {pos}")]
@@ -198,16 +289,16 @@ struct Action {
     set_index: u32,
     /// Global field id across all sets; indexes MachineState.satisfied.
     field_bit: u32,
-    type_check: FieldType,
+    type_check: MachineFieldType,
     predicate: Option<Regex>,
     /// Index into MachineState.capture_locs; u32::MAX when predicate is None.
     predicate_loc: u32,
     /// (regex group index, machine capture index) for named groups not starting with '_'.
-    predicate_groups: Box<[(u32, u32)]>,
-    value_capture: Option<u32>,
+    predicate_groups: Box<[(u32, NonZero<u32>)]>,
+    value_capture: Option<NonZero<u32>>,
     /// Coverage for an exhaustive container field; None for ordinary fields.
     /// Placeholder (empty) until compile's coverage pass fills it in.
-    exhaustive: Option<Box<ExhaustiveCoverage>>,
+    exhaustive: Option<ExhaustiveCoverage>,
 }
 
 /// One bit per machine node: whether that node's subtree contains any action
@@ -258,6 +349,7 @@ pub struct MatchMachine {
     set_required_counts: Box<[u32]>,
     nodes: Box<[Node]>,
     actions: Box<[Action]>,
+    literal_pool: Box<[u8]>,
 }
 
 #[derive(Debug)]
@@ -279,8 +371,8 @@ impl MachineResult {
         self.match_results.iter_ones().map(|i| i as u32)
     }
 
-    pub fn capture(&self, machine_capture_index: u32) -> Option<&CaptureValue> {
-        self.capture_values[machine_capture_index as usize].as_ref()
+    pub fn capture(&self, machine_capture_index: MachineCaptureIndex) -> Option<&CaptureValue> {
+        self.capture_values[machine_capture_index.get() as usize].as_ref()
     }
 
     pub fn captures(&self) -> &[Option<CaptureValue>] {
@@ -447,20 +539,21 @@ fn literal_is_valid_json(text: &str) -> bool {
     if text.len() > u32::MAX as usize {
         return false;
     }
-    let machine = MatchMachine {
+    static MACHINE: LazyLock<MatchMachine> = LazyLock::new(|| MatchMachine {
         captures_length: 0,
         fields_length: 0,
         predicates_length: 0,
         set_required_counts: Box::new([]),
         nodes: Box::new([]),
         actions: Box::new([]),
-    };
-    let mut state = machine.allocate_state();
+        literal_pool: Box::new([]),
+    });
+    let mut state = MACHINE.allocate_state();
     // A value of len bytes nests at most len/2 levels; the literal itself
     // must never fail on depth.
     state.set_depth_limit(text.len() / 2 + 1);
     let matcher = Matcher {
-        machine: &machine,
+        machine: &MACHINE,
         input: text,
         bytes: text.as_bytes(),
     };
@@ -478,14 +571,6 @@ fn validate_pattern(set_index: u32, fields: &[FieldPattern<'_>]) -> Result<(), C
             )
         {
             return Err(CompileError::ExhaustiveUnsupportedType {
-                set_index,
-                field_index,
-            });
-        }
-        if let FieldType::Literal(literal) = &field.r#type
-            && !literal_is_valid_json(literal)
-        {
-            return Err(CompileError::InvalidLiteral {
                 set_index,
                 field_index,
             });
@@ -581,18 +666,20 @@ impl MatchMachine {
 
     pub fn compile<'a>(
         match_sets: impl Iterator<Item = Pattern<'a>>,
-        mut capture_index_callback: impl FnMut(CaptureCallbackArgs),
+        mut capture_index_callback: impl FnMut(CaptureCallbackArgs<'a>),
     ) -> Result<MatchMachine, CompileError> {
         let mut nodes: Vec<NodeBuild> = vec![NodeBuild::default()];
         let mut set_required_counts: Vec<u32> = Vec::new();
-        let mut next_machine_capture_index: u32 = 0;
+        let mut next_machine_capture_index: NonZero<u32> = NonZero::new(1).unwrap();
         let mut next_field_bit: u32 = 0;
         let mut next_predicate_loc: u32 = 0;
+
+        let mut literal_pool: Vec<u8> = Vec::new();
 
         for (set_index, set) in match_sets.enumerate() {
             validate_pattern(set_index as u32, set.fields)?;
             set_required_counts.push(set.fields.len() as u32);
-            let mut next_set_capture_index: u32 = 0;
+            let mut next_set_capture_index: NonZero<u32> = NonZero::new(1).unwrap();
             for (field_index, field) in set.fields.iter().enumerate() {
                 let mut node: NodeId = NodeId(0);
                 for segment in field.path {
@@ -604,12 +691,14 @@ impl MatchMachine {
                         match_set_index: set_index as u32,
                         field_index: field_index as u32,
                         predicate_capture_name: None,
-                        capture_index_in_set: next_set_capture_index,
-                        capture_index_in_machine: next_machine_capture_index,
+                        capture_index_in_set: SetCaptureIndex(next_set_capture_index),
+                        capture_index_in_machine: MachineCaptureIndex(next_machine_capture_index),
                     });
                     let index = next_machine_capture_index;
-                    next_machine_capture_index += 1;
-                    next_set_capture_index += 1;
+                    next_machine_capture_index = next_machine_capture_index
+                        .checked_add(1)
+                        .ok_or_else(|| CompileError::TooManyCaptures)?;
+                    next_set_capture_index = next_set_capture_index.checked_add(1).unwrap();
                     Some(index)
                 } else {
                     None
@@ -626,12 +715,16 @@ impl MatchMachine {
                                 match_set_index: set_index as u32,
                                 field_index: field_index as u32,
                                 predicate_capture_name: Some(name),
-                                capture_index_in_set: next_set_capture_index,
-                                capture_index_in_machine: next_machine_capture_index,
+                                capture_index_in_set: SetCaptureIndex(next_set_capture_index),
+                                capture_index_in_machine: MachineCaptureIndex(
+                                    next_machine_capture_index,
+                                ),
                             });
                             predicate_groups.push((group_index as u32, next_machine_capture_index));
-                            next_machine_capture_index += 1;
-                            next_set_capture_index += 1;
+                            next_machine_capture_index = next_machine_capture_index
+                                .checked_add(1)
+                                .ok_or_else(|| CompileError::TooManyCaptures)?;
+                            next_set_capture_index = next_set_capture_index.checked_add(1).unwrap();
                         }
                     }
                     predicate_loc = next_predicate_loc;
@@ -641,14 +734,45 @@ impl MatchMachine {
                 nodes[node.index()].actions.push(Action {
                     set_index: set_index as u32,
                     field_bit: next_field_bit,
-                    type_check: field.r#type.clone(),
+                    type_check: match field.r#type {
+                        FieldType::Object => MachineFieldType::Object,
+                        FieldType::Array => MachineFieldType::Array,
+                        FieldType::String => MachineFieldType::String,
+                        FieldType::Number => MachineFieldType::Number,
+                        FieldType::Bool => MachineFieldType::Bool,
+                        FieldType::Null => MachineFieldType::Null,
+                        FieldType::Literal(ref s) => {
+                            if !literal_is_valid_json(s) {
+                                return Err(CompileError::InvalidLiteral {
+                                    set_index: set_index as u32,
+                                    field_index: field_index as u32,
+                                });
+                            }
+
+                            let pool_index = literal_pool.len();
+                            let len: u32 =
+                                s.len()
+                                    .try_into()
+                                    .map_err(|_| CompileError::LiteralTooLong {
+                                        set_index: set_index as u32,
+                                        field_index: field_index as u32,
+                                    })?;
+                            // let mut len_buf = [0u8; 5];
+                            // let len_buf_n = len.encode_var(&mut len_buf);
+                            // literal_pool.extend_from_slice(&len_buf[0..len_buf_n]);
+                            literal_pool.extend_from_slice(s.as_bytes());
+                            let Some((lsb, msb)) = usize_to_u24(pool_index) else {
+                                return Err(CompileError::TooManyLiterals);
+                            };
+                            MachineFieldType::Literal { len, lsb, msb }
+                        }
+                        FieldType::Any => MachineFieldType::Any,
+                    },
                     predicate: field.predicate.clone(),
                     predicate_loc,
                     predicate_groups: predicate_groups.into_boxed_slice(),
                     value_capture,
-                    exhaustive: field
-                        .exhaustive
-                        .then(|| Box::new(ExhaustiveCoverage::default())),
+                    exhaustive: field.exhaustive.then(ExhaustiveCoverage::default),
                 });
                 next_field_bit += 1;
             }
@@ -660,7 +784,10 @@ impl MatchMachine {
         let mut final_nodes: Vec<Node> = Vec::with_capacity(nodes.len());
         for mut build in nodes {
             let start = actions.len() as u32;
-            let has_exhaustive = build.actions.iter().any(|action| action.exhaustive.is_some());
+            let has_exhaustive = build
+                .actions
+                .iter()
+                .any(|action| action.exhaustive.is_some());
             actions.append(&mut build.actions);
             let mut index_children = build.index_children.into_iter().collect::<Vec<_>>();
             index_children.sort_unstable_by_key(|&IndexChild { index, .. }| index);
@@ -682,8 +809,7 @@ impl MatchMachine {
         // have higher node indices than their parent, so a reverse scan sees
         // every child's set membership before its parent needs it.
         let num_sets = set_required_counts.len();
-        let mut node_sets: Vec<BitBox> =
-            vec![bitbox![usize, Lsb0; 0; num_sets]; final_nodes.len()];
+        let mut node_sets: Vec<BitBox> = vec![bitbox![usize, Lsb0; 0; num_sets]; final_nodes.len()];
         for node_index in (0..final_nodes.len()).rev() {
             let node = &final_nodes[node_index];
             let mut sets = bitbox![usize, Lsb0; 0; num_sets];
@@ -715,12 +841,13 @@ impl MatchMachine {
         }
 
         Ok(MatchMachine {
-            captures_length: next_machine_capture_index,
+            captures_length: next_machine_capture_index.get() - 1,
             fields_length: next_field_bit,
             predicates_length: next_predicate_loc,
             set_required_counts: set_required_counts.into_boxed_slice(),
             nodes: final_nodes.into_boxed_slice(),
             actions: actions.into_boxed_slice(),
+            literal_pool: literal_pool.into_boxed_slice(),
         })
     }
 
@@ -728,7 +855,7 @@ impl MatchMachine {
     /// [`MatchError::InputTooLong`].
     pub fn match_string(&self, string: &str, state: &mut MachineState) -> Result<(), MatchError> {
         if string.len() > u32::MAX as usize {
-            return Err(MatchError::InputTooLong { len: string.len() });
+            return Err(MatchError::InputTooLong);
         }
 
         state.result.capture_values.fill_with(|| None);
@@ -1270,22 +1397,24 @@ impl Matcher<'_, '_> {
             if state.satisfied[action.field_bit as usize] {
                 continue;
             }
-            if check_exhaustive
-                && state.exhaustive_violated[node.actions.start as usize + offset]
-            {
+            if check_exhaustive && state.exhaustive_violated[node.actions.start as usize + offset] {
                 continue;
             }
-            let type_ok = match &action.type_check {
-                FieldType::Object => first == b'{',
-                FieldType::Array => first == b'[',
-                FieldType::String => first == b'"',
-                FieldType::Number => matches!(first, b'-' | b'0'..=b'9'),
-                FieldType::Bool => matches!(first, b't' | b'f'),
-                FieldType::Null => first == b'n',
-                FieldType::Literal(literal) => {
-                    literal.as_bytes() == &self.bytes[range_u32_to_usize(range)]
+            let type_ok = match action.type_check {
+                MachineFieldType::Object => first == b'{',
+                MachineFieldType::Array => first == b'[',
+                MachineFieldType::String => first == b'"',
+                MachineFieldType::Number => matches!(first, b'-' | b'0'..=b'9'),
+                MachineFieldType::Bool => matches!(first, b't' | b'f'),
+                MachineFieldType::Null => first == b'n',
+                MachineFieldType::Literal { len, lsb, msb } => {
+                    // let pool_slice = &self.machine.literal_pool[u24_to_usize(lsb, msb)..];
+                    // let (len, off) = u32::decode_var(&pool_slice).unwrap();
+                    let off = u24_to_usize(lsb, msb);
+                    let literal = &self.machine.literal_pool[off..off + len as usize];
+                    literal == &self.bytes[range_u32_to_usize(range)]
                 }
-                FieldType::Any => true,
+                MachineFieldType::Any => true,
             };
             if !type_ok {
                 continue;
@@ -1336,7 +1465,7 @@ impl Matcher<'_, '_> {
                                 })
                             })
                         });
-                    state.result.capture_values[capture_index as usize] = value;
+                    state.result.capture_values[(capture_index.get() - 1) as usize] = value;
                 }
             }
 
@@ -1346,7 +1475,7 @@ impl Matcher<'_, '_> {
             if let Some(capture_index) = action.value_capture {
                 let value =
                     self.build_capture(first, range, string_escaped, &mut buf_ready, state)?;
-                state.result.capture_values[capture_index as usize] = Some(value);
+                state.result.capture_values[(capture_index.get() - 1) as usize] = Some(value);
             }
         }
         Ok(())

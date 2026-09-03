@@ -5,14 +5,16 @@ edition = "2024"
 
 [features]
 serde = ["dep:serde", "compact_str/serde"]
-benchmarking = ["dep:rand"]
+benchmarking = ["dep:rand", "dep:serde_json"]
 
 [dependencies]
 bitvec = "1.1.1"
 compact_str = "0.10.0"
+integer-encoding = "4.1.0"
 rand = { version = "0.10.2", default-features = false, features = ["std_rng"], optional = true }
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
 soa-rs = "1.0.1"
 thiserror = "2.0.20"
 

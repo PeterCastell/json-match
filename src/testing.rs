@@ -198,7 +198,7 @@ impl Emitter<'_, '_, '_> {
 
     fn terminal(&mut self, ty: &FieldType) -> String {
         match ty {
-            FieldType::String => format!("{:?}", rand_name(self.rng)),
+            FieldType::String => serde_json::to_string(&rand_string(self.rng)).unwrap(),
             FieldType::Number => noise_number(self.rng),
             FieldType::Bool => self.rng.random_bool(0.5).to_string(),
             FieldType::Null => "null".to_string(),
@@ -260,7 +260,7 @@ impl Emitter<'_, '_, '_> {
 
     fn primitive(&mut self) -> String {
         match self.rng.random_range(0..4) {
-            0 => format!("{:?}", rand_name(self.rng)),
+            0 => serde_json::to_string(&rand_string(self.rng)).unwrap(),
             1 => noise_number(self.rng),
             2 => self.rng.random_bool(0.5).to_string(),
             _ => "null".to_string(),
@@ -269,9 +269,24 @@ impl Emitter<'_, '_, '_> {
 }
 
 fn rand_name(rng: &mut StdRng) -> String {
-    let len = rng.random_range(3..=8);
+    let len = rng.random_range(1..=16);
     (0..len)
         .map(|_| char::from(rng.sample(Alphanumeric)))
+        .collect()
+}
+
+fn rand_string(rng: &mut StdRng) -> String {
+    let len = rng.random_range(1..=128);
+    (0..len)
+        .map(|_| {
+            if rng.random_bool(0.001) {
+                rng.sample(rand::distr::StandardUniform::default())
+            } else if rng.random_bool(0.01) {
+                *rng.sample(rand::distr::slice::Choose::new(b"\n\r\t ").unwrap()) as char
+            } else {
+                char::from(rng.sample(Alphanumeric))
+            }
+        })
         .collect()
 }
 
@@ -317,13 +332,15 @@ mod tests {
     use std::assert_matches;
 
     use crate::{
-        CaptureValue, CompileError, DEFAULT_DEPTH_LIMIT, FieldPattern, FieldType, MachineState,
-        MatchError, MatchMachine, PathSegment, Pattern, UnescapedString, range_u32_to_usize,
+        CaptureCallbackArgs, CaptureValue, CompileError, DEFAULT_DEPTH_LIMIT, FieldPattern,
+        FieldType, MachineCaptureIndex, MachineState, MatchError, MatchMachine, PathSegment,
+        Pattern, SetCaptureIndex, UnescapedString, range_u32_to_usize,
         testing::{generate_test_json, test_fields},
     };
 
     /// Machine capture indices keyed by (set index, field index, predicate group name).
-    type CaptureIndices = std::collections::HashMap<(u32, u32, Option<String>), u32>;
+    type CaptureIndices =
+        std::collections::HashMap<(u32, u32, Option<String>), MachineCaptureIndex>;
 
     fn compile_err(sets: &[&[FieldPattern<'_>]]) -> CompileError {
         MatchMachine::compile(sets.iter().map(|fields| Pattern { fields }), |_| {}).unwrap_err()
@@ -982,28 +999,52 @@ mod tests {
             field(vec![key("c")], FieldType::Number, None, true),
         ];
         let set1 = [field(vec![key("d")], FieldType::Number, None, true)];
-        let mut seen: Vec<(u32, u32, Option<String>, u32, u32)> = Vec::new();
+        let mut seen: Vec<CaptureCallbackArgs> = Vec::new();
         MatchMachine::compile(
             [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
             |args| {
-                seen.push((
-                    args.match_set_index,
-                    args.field_index,
-                    args.predicate_capture_name.map(str::to_owned),
-                    args.capture_index_in_set,
-                    args.capture_index_in_machine,
-                ));
+                seen.push(args);
             },
         )
         .unwrap();
         assert_eq!(
             seen,
-            vec![
-                (0, 0, None, 0, 0),
-                (0, 0, Some("g1".to_owned()), 1, 1),
-                (0, 0, Some("g2".to_owned()), 2, 2),
-                (0, 2, None, 3, 3),
-                (1, 0, None, 0, 4),
+            &[
+                CaptureCallbackArgs {
+                    match_set_index: 0,
+                    field_index: 0,
+                    predicate_capture_name: None,
+                    capture_index_in_set: SetCaptureIndex::new(0).unwrap(),
+                    capture_index_in_machine: MachineCaptureIndex::new(0).unwrap(),
+                },
+                CaptureCallbackArgs {
+                    match_set_index: 0,
+                    field_index: 0,
+                    predicate_capture_name: Some("g1"),
+                    capture_index_in_set: SetCaptureIndex::new(1).unwrap(),
+                    capture_index_in_machine: MachineCaptureIndex::new(1).unwrap(),
+                },
+                CaptureCallbackArgs {
+                    match_set_index: 0,
+                    field_index: 0,
+                    predicate_capture_name: Some("g2"),
+                    capture_index_in_set: SetCaptureIndex::new(2).unwrap(),
+                    capture_index_in_machine: MachineCaptureIndex::new(2).unwrap(),
+                },
+                CaptureCallbackArgs {
+                    match_set_index: 0,
+                    field_index: 2,
+                    predicate_capture_name: None,
+                    capture_index_in_set: SetCaptureIndex::new(3).unwrap(),
+                    capture_index_in_machine: MachineCaptureIndex::new(3).unwrap(),
+                },
+                CaptureCallbackArgs {
+                    match_set_index: 1,
+                    field_index: 0,
+                    predicate_capture_name: None,
+                    capture_index_in_set: SetCaptureIndex::new(0).unwrap(),
+                    capture_index_in_machine: MachineCaptureIndex::new(4).unwrap(),
+                },
             ]
         );
     }
@@ -1292,7 +1333,12 @@ mod tests {
             xfield(vec![key("arr")], FieldType::Array, false),
             field(vec![key("arr"), Index(0)], FieldType::Any, None, false),
         ];
-        let set1 = [field(vec![key("arr"), AnyIndex], FieldType::String, None, false)];
+        let set1 = [field(
+            vec![key("arr"), AnyIndex],
+            FieldType::String,
+            None,
+            false,
+        )];
         let (machine, _) = compile(&[&set0, &set1]);
         let state = run(&machine, r#"{"arr":["x"]}"#).unwrap();
         assert!(state.result.did_match(0));
@@ -1471,14 +1517,34 @@ mod tests {
             "-0.5e2",
             "[1, 2]",
         ] {
-            let fields = [field(vec![key("l")], FieldType::Literal(good.into()), None, false)];
+            let fields = [field(
+                vec![key("l")],
+                FieldType::Literal(good.into()),
+                None,
+                false,
+            )];
             assert!(
                 MatchMachine::compile([Pattern { fields: &fields }].into_iter(), |_| {}).is_ok(),
                 "should compile: {good}"
             );
         }
-        for bad in ["nope", "01", "1 2", " 1", "1 ", "1.", "", "tru", r#"{"a":}"#] {
-            let fields = [field(vec![key("l")], FieldType::Literal(bad.into()), None, false)];
+        for bad in [
+            "nope",
+            "01",
+            "1 2",
+            " 1",
+            "1 ",
+            "1.",
+            "",
+            "tru",
+            r#"{"a":}"#,
+        ] {
+            let fields = [field(
+                vec![key("l")],
+                FieldType::Literal(bad.into()),
+                None,
+                false,
+            )];
             assert_matches!(
                 compile_err(&[&fields]),
                 CompileError::InvalidLiteral {
@@ -1506,7 +1572,12 @@ mod tests {
                 field(vec![key("foo"), key("baz")], FieldType::Any, None, false),
             ],
             [
-                field(vec![key("foo")], FieldType::Literal("{}".into()), None, false),
+                field(
+                    vec![key("foo")],
+                    FieldType::Literal("{}".into()),
+                    None,
+                    false,
+                ),
                 field(vec![key("foo"), key("k")], FieldType::Any, None, false),
             ],
         ];
@@ -1546,7 +1617,12 @@ mod tests {
         assert!(MatchMachine::compile([Pattern { fields: &good }].into_iter(), |_| {}).is_ok());
         // Different sets may disagree about a path's type.
         let set0 = [field(vec![key("foo")], FieldType::Object, None, false)];
-        let set1 = [field(vec![key("foo"), Index(0)], FieldType::Any, None, false)];
+        let set1 = [field(
+            vec![key("foo"), Index(0)],
+            FieldType::Any,
+            None,
+            false,
+        )];
         assert!(
             MatchMachine::compile(
                 [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
@@ -1573,8 +1649,18 @@ mod tests {
         );
         // Deeper shared prefix.
         let fields = [
-            field(vec![key("x"), key("y"), key("a")], FieldType::Any, None, false),
-            field(vec![key("x"), key("y"), AnyIndex], FieldType::Any, None, false),
+            field(
+                vec![key("x"), key("y"), key("a")],
+                FieldType::Any,
+                None,
+                false,
+            ),
+            field(
+                vec![key("x"), key("y"), AnyIndex],
+                FieldType::Any,
+                None,
+                false,
+            ),
         ];
         assert_matches!(
             compile_err(&[&fields]),
@@ -1633,7 +1719,12 @@ mod tests {
         // Another set descending with AnyIndex is allowed (coverage is
         // per-set; see exhaustive_cross_set_any_index_never_covers).
         let set0 = [xfield(vec![key("arr")], FieldType::Array, false)];
-        let set1 = [field(vec![key("arr"), AnyIndex], FieldType::Any, None, false)];
+        let set1 = [field(
+            vec![key("arr"), AnyIndex],
+            FieldType::Any,
+            None,
+            false,
+        )];
         assert!(
             MatchMachine::compile(
                 [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
@@ -1664,7 +1755,9 @@ mod tests {
         }
         for ty in [FieldType::Object, FieldType::Array, FieldType::Any] {
             let fields = [xfield(vec![key("v")], ty, false)];
-            assert!(MatchMachine::compile([Pattern { fields: &fields }].into_iter(), |_| {}).is_ok());
+            assert!(
+                MatchMachine::compile([Pattern { fields: &fields }].into_iter(), |_| {}).is_ok()
+            );
         }
     }
 
