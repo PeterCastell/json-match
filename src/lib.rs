@@ -26,6 +26,14 @@ pub struct FieldPattern<'a> {
     /// unescaped content; for every other type it is the raw JSON text.
     pub predicate: Option<Regex>,
     pub capture: bool,
+    /// Marks this container as exhaustive: every member of the matched value
+    /// (object key / array index) must lie on the path of another field of the
+    /// same set that descends through this container, or this field is left
+    /// unsatisfied. Only [`FieldType::Object`], [`FieldType::Array`], and
+    /// [`FieldType::Any`] support it (for `Any`, non-container values are
+    /// trivially exhaustive), and same-set fields may not descend an
+    /// exhaustive container with [`PathSegment::AnyIndex`].
+    pub exhaustive: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -111,7 +119,52 @@ pub struct CaptureCallbackArgs<'a> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum CompileError {}
+pub enum CompileError {
+    /// A [`FieldType::Literal`] whose text is not exactly one valid JSON
+    /// value. Leading and trailing whitespace also count as invalid: literal
+    /// comparison is byte-for-byte against a value span, which never includes
+    /// surrounding whitespace, so a padded literal could never match.
+    #[error("literal of field {field_index} in set {set_index} is not valid JSON")]
+    InvalidLiteral { set_index: u32, field_index: u32 },
+    /// A field's path descends another field whose declared type contradicts
+    /// the descent: an Object descended with an index, an Array descended with
+    /// a key, or a non-container type descended at all. `Any` accepts either
+    /// kind of descent.
+    #[error(
+        "field {field_index} in set {set_index} descends field {container_field_index}, whose declared type does not allow it"
+    )]
+    ContainerTypeMismatch {
+        set_index: u32,
+        container_field_index: u32,
+        field_index: u32,
+    },
+    /// Two fields of the same set descend the same path position as different
+    /// container kinds (one as an object key, the other as an array index), so
+    /// no value could ever satisfy both.
+    #[error(
+        "fields {field_index_a} and {field_index_b} in set {set_index} imply different container types for the same path"
+    )]
+    ConflictingContainerKinds {
+        set_index: u32,
+        field_index_a: u32,
+        field_index_b: u32,
+    },
+    /// A field descends an exhaustive container of the same set using
+    /// [`PathSegment::AnyIndex`] anywhere below it, which would make the
+    /// exhaustive coverage of array indices unknowable.
+    #[error(
+        "field {field_index} in set {set_index} descends exhaustive field {container_field_index} with AnyIndex"
+    )]
+    AnyIndexUnderExhaustive {
+        set_index: u32,
+        container_field_index: u32,
+        field_index: u32,
+    },
+    /// `exhaustive` set on a field whose type has no members to enumerate;
+    /// only Object, Array, and Any support it.
+    #[error("field {field_index} in set {set_index} is exhaustive but its type does not support it")]
+    ExhaustiveUnsupportedType { set_index: u32, field_index: u32 },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MatchError {
@@ -152,6 +205,17 @@ struct Action {
     /// (regex group index, machine capture index) for named groups not starting with '_'.
     predicate_groups: Box<[(u32, u32)]>,
     value_capture: Option<u32>,
+    /// Coverage for an exhaustive container field; None for ordinary fields.
+    /// Placeholder (empty) until compile's coverage pass fills it in.
+    exhaustive: Option<Box<ExhaustiveCoverage>>,
+}
+
+/// One bit per machine node: whether that node's subtree contains any action
+/// of the exhaustive field's set. A container member resolving to no child or
+/// to an uncovered child violates the exhaustive field.
+#[derive(Debug, Clone, Default)]
+struct ExhaustiveCoverage {
+    covered_nodes: BitBox,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +244,10 @@ struct Node {
     index_children: Soa<IndexChild>,
     any_index_child: Option<NodeId>,
     actions: Range<u32>,
+    /// Whether any action of this node is exhaustive: containers are then
+    /// always walked (never skipped via validate_value) so coverage of their
+    /// members can be checked.
+    has_exhaustive: bool,
 }
 
 #[derive(Debug)]
@@ -232,6 +300,11 @@ pub struct MachineState {
     /// One bit per open container while validating skipped regions
     /// (1 = object, 0 = array); its length is the nesting depth limit.
     bracket_stack: BitBox,
+    /// One bit per machine action: whether the container instance currently
+    /// being walked violated that exhaustive action. Reset by the walk of each
+    /// container instance and read by run_actions right after it, so no
+    /// per-match reset is needed.
+    exhaustive_violated: BitBox,
 }
 
 impl MachineState {
@@ -359,6 +432,120 @@ fn merge_wildcards(nodes: &mut Vec<NodeBuild>, node: NodeId) {
     }
 }
 
+fn segments_equal(a: &PathSegment, b: &PathSegment) -> bool {
+    match (a, b) {
+        (PathSegment::Key(x), PathSegment::Key(y)) => x == y,
+        (PathSegment::Index(x), PathSegment::Index(y)) => x == y,
+        (PathSegment::AnyIndex, PathSegment::AnyIndex) => true,
+        _ => false,
+    }
+}
+
+/// Whether text is exactly one valid JSON value, with no surrounding
+/// whitespace. Reuses the matcher's validator on an empty machine.
+fn literal_is_valid_json(text: &str) -> bool {
+    if text.len() > u32::MAX as usize {
+        return false;
+    }
+    let machine = MatchMachine {
+        captures_length: 0,
+        fields_length: 0,
+        predicates_length: 0,
+        set_required_counts: Box::new([]),
+        nodes: Box::new([]),
+        actions: Box::new([]),
+    };
+    let mut state = machine.allocate_state();
+    // A value of len bytes nests at most len/2 levels; the literal itself
+    // must never fail on depth.
+    state.set_depth_limit(text.len() / 2 + 1);
+    let matcher = Matcher {
+        machine: &machine,
+        input: text,
+        bytes: text.as_bytes(),
+    };
+    matches!(matcher.validate_value(0, &mut state), Ok(end) if end as usize == text.len())
+}
+
+/// Per-set structural validation; see [`CompileError`] for the rules.
+fn validate_pattern(set_index: u32, fields: &[FieldPattern<'_>]) -> Result<(), CompileError> {
+    for (field_index, field) in fields.iter().enumerate() {
+        let field_index = field_index as u32;
+        if field.exhaustive
+            && !matches!(
+                field.r#type,
+                FieldType::Object | FieldType::Array | FieldType::Any
+            )
+        {
+            return Err(CompileError::ExhaustiveUnsupportedType {
+                set_index,
+                field_index,
+            });
+        }
+        if let FieldType::Literal(literal) = &field.r#type
+            && !literal_is_valid_json(literal)
+        {
+            return Err(CompileError::InvalidLiteral {
+                set_index,
+                field_index,
+            });
+        }
+    }
+    for (a_index, a) in fields.iter().enumerate() {
+        for (b_index, b) in fields.iter().enumerate() {
+            if a_index == b_index {
+                continue;
+            }
+            let common = a
+                .path
+                .iter()
+                .zip(b.path)
+                .take_while(|(x, y)| segments_equal(x, y))
+                .count();
+            if common == a.path.len() && common < b.path.len() {
+                // b descends a.
+                let compatible = match (&a.r#type, &b.path[common]) {
+                    (FieldType::Any, _) => true,
+                    (FieldType::Object, PathSegment::Key(_)) => true,
+                    (FieldType::Array, PathSegment::Index(_) | PathSegment::AnyIndex) => true,
+                    _ => false,
+                };
+                if !compatible {
+                    return Err(CompileError::ContainerTypeMismatch {
+                        set_index,
+                        container_field_index: a_index as u32,
+                        field_index: b_index as u32,
+                    });
+                }
+                if a.exhaustive
+                    && b.path[common..]
+                        .iter()
+                        .any(|segment| matches!(segment, PathSegment::AnyIndex))
+                {
+                    return Err(CompileError::AnyIndexUnderExhaustive {
+                        set_index,
+                        container_field_index: a_index as u32,
+                        field_index: b_index as u32,
+                    });
+                }
+            } else if a_index < b_index && common < a.path.len() && common < b.path.len() {
+                // Paths diverge: the diverging segments must agree on the
+                // container kind they expect at the shared prefix.
+                let a_is_key = matches!(a.path[common], PathSegment::Key(_));
+                let b_is_key = matches!(b.path[common], PathSegment::Key(_));
+                if a_is_key != b_is_key {
+                    return Err(CompileError::ConflictingContainerKinds {
+                        set_index,
+                        field_index_a: a_index as u32,
+                        field_index_b: b_index as u32,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MatchMachine {
     pub fn num_match_sets(&self) -> u32 {
         self.set_required_counts.len() as u32
@@ -388,6 +575,7 @@ impl MatchMachine {
             capture_locs: locs.into_iter().map(|slot| slot.unwrap()).collect(),
             unescape_buf: String::new(),
             bracket_stack: bitbox![usize, Lsb0; 0; DEFAULT_DEPTH_LIMIT],
+            exhaustive_violated: bitbox![usize, Lsb0; 0; self.actions.len()],
         }
     }
 
@@ -402,6 +590,7 @@ impl MatchMachine {
         let mut next_predicate_loc: u32 = 0;
 
         for (set_index, set) in match_sets.enumerate() {
+            validate_pattern(set_index as u32, set.fields)?;
             set_required_counts.push(set.fields.len() as u32);
             let mut next_set_capture_index: u32 = 0;
             for (field_index, field) in set.fields.iter().enumerate() {
@@ -457,6 +646,9 @@ impl MatchMachine {
                     predicate_loc,
                     predicate_groups: predicate_groups.into_boxed_slice(),
                     value_capture,
+                    exhaustive: field
+                        .exhaustive
+                        .then(|| Box::new(ExhaustiveCoverage::default())),
                 });
                 next_field_bit += 1;
             }
@@ -468,6 +660,7 @@ impl MatchMachine {
         let mut final_nodes: Vec<Node> = Vec::with_capacity(nodes.len());
         for mut build in nodes {
             let start = actions.len() as u32;
+            let has_exhaustive = build.actions.iter().any(|action| action.exhaustive.is_some());
             actions.append(&mut build.actions);
             let mut index_children = build.index_children.into_iter().collect::<Vec<_>>();
             index_children.sort_unstable_by_key(|&IndexChild { index, .. }| index);
@@ -479,7 +672,46 @@ impl MatchMachine {
                     start,
                     end: actions.len() as u32,
                 },
+                has_exhaustive,
             });
+        }
+
+        // Exhaustive coverage pass: a child is covered for an exhaustive
+        // action when the child's subtree contains any action of the same set
+        // (the child then lies on that set's field paths). Children always
+        // have higher node indices than their parent, so a reverse scan sees
+        // every child's set membership before its parent needs it.
+        let num_sets = set_required_counts.len();
+        let mut node_sets: Vec<BitBox> =
+            vec![bitbox![usize, Lsb0; 0; num_sets]; final_nodes.len()];
+        for node_index in (0..final_nodes.len()).rev() {
+            let node = &final_nodes[node_index];
+            let mut sets = bitbox![usize, Lsb0; 0; num_sets];
+            for action in &actions[range_u32_to_usize(node.actions)] {
+                sets.set(action.set_index as usize, true);
+            }
+            let children = node
+                .key_children
+                .iter()
+                .map(|&(_, child)| child)
+                .chain(node.index_children.child().iter().copied())
+                .chain(node.any_index_child);
+            for child in children {
+                for set in node_sets[child.index()].iter_ones() {
+                    sets.set(set, true);
+                }
+            }
+            node_sets[node_index] = sets;
+        }
+        for action in actions.iter_mut() {
+            let set = action.set_index as usize;
+            if let Some(coverage) = &mut action.exhaustive {
+                coverage.covered_nodes = node_sets
+                    .iter()
+                    .map(|sets| sets[set])
+                    .collect::<bitvec::vec::BitVec>()
+                    .into_boxed_bitslice();
+            }
         }
 
         Ok(MatchMachine {
@@ -561,8 +793,13 @@ impl Matcher<'_, '_> {
         let first = self.peek(pos)?;
         let mut string_escaped = false;
         let end = match first {
-            b'{' if !node.key_children.is_empty() => self.walk_object(pos, node, state)?,
-            b'[' if node.any_index_child.is_some() || !node.index_children.is_empty() => {
+            b'{' if !node.key_children.is_empty() || node.has_exhaustive => {
+                self.walk_object(pos, node, state)?
+            }
+            b'[' if node.any_index_child.is_some()
+                || !node.index_children.is_empty()
+                || node.has_exhaustive =>
+            {
                 self.walk_array(pos, node, state)?
             }
             b'"' => {
@@ -578,12 +815,19 @@ impl Matcher<'_, '_> {
         Ok(end)
     }
 
+    // NOTE: monomorphizing the walks and run_actions over has_exhaustive
+    // (const-generic true/false copies) was benchmarked and lost badly to
+    // these runtime branches (up to +25% on small documents): the doubled
+    // code pushed the hot loops apart in the icache.
     fn walk_object(
         &self,
         pos: u32,
         node: &Node,
         state: &mut MachineState,
     ) -> Result<u32, MatchError> {
+        if node.has_exhaustive {
+            self.reset_exhaustive(node, state);
+        }
         let mut pos = self.skip_ws(pos + 1);
         if self.peek(pos)? == b'}' {
             return Ok(pos + 1);
@@ -601,6 +845,9 @@ impl Matcher<'_, '_> {
                 key_escaped,
                 state,
             )?;
+            if node.has_exhaustive {
+                self.flag_uncovered(node, child, state);
+            }
             pos = self.skip_ws(key_end);
             let byte = self.peek(pos)?;
             if byte != b':' {
@@ -648,12 +895,45 @@ impl Matcher<'_, '_> {
             .map(|&(_, child)| child))
     }
 
+    /// Clears the violation bits of the node's exhaustive actions at the start
+    /// of walking one container instance. The exhaustive helpers are #[cold]
+    /// so patterns without exhaustive fields pay only the has_exhaustive
+    /// branches, not the helpers' code in their walk loops.
+    #[cold]
+    fn reset_exhaustive(&self, node: &Node, state: &mut MachineState) {
+        for action_index in range_u32_to_usize(node.actions) {
+            if self.machine.actions[action_index].exhaustive.is_some() {
+                state.exhaustive_violated.set(action_index, false);
+            }
+        }
+    }
+
+    /// Marks every exhaustive action of the node not covering the container
+    /// member that resolved to `child` as violated (None: a member no field
+    /// path descends). For arrays, pass the fixed-index child only: an element
+    /// reached through any_index_child is never covered — same-set AnyIndex
+    /// under an exhaustive container is rejected at compile time, so such an
+    /// element can only belong to other sets.
+    #[cold]
+    fn flag_uncovered(&self, node: &Node, child: Option<NodeId>, state: &mut MachineState) {
+        for action_index in range_u32_to_usize(node.actions) {
+            if let Some(coverage) = &self.machine.actions[action_index].exhaustive
+                && !child.is_some_and(|child| coverage.covered_nodes[child.index()])
+            {
+                state.exhaustive_violated.set(action_index, true);
+            }
+        }
+    }
+
     fn walk_array(
         &self,
         pos: u32,
         node: &Node,
         state: &mut MachineState,
     ) -> Result<u32, MatchError> {
+        if node.has_exhaustive {
+            self.reset_exhaustive(node, state);
+        }
         let mut pos = self.skip_ws(pos + 1);
         if self.peek(pos)? == b']' {
             return Ok(pos + 1);
@@ -662,10 +942,16 @@ impl Matcher<'_, '_> {
         // this branch is laid out and predicted accordingly.
         if node.index_children.len() <= 512 {
             for index in 0..=u16::MAX {
-                let child = match node.index_children.index().iter().position(|&i| i == index) {
-                    Some(found) => Some(node.index_children.child()[found]),
-                    None => node.any_index_child,
-                };
+                let fixed = node
+                    .index_children
+                    .index()
+                    .iter()
+                    .position(|&i| i == index)
+                    .map(|found| node.index_children.child()[found]);
+                if node.has_exhaustive {
+                    self.flag_uncovered(node, fixed, state);
+                }
+                let child = fixed.or(node.any_index_child);
                 pos = match child {
                     Some(child) => self.process_value(pos, child, state)?,
                     None => self.validate_value(pos, state)?,
@@ -691,10 +977,16 @@ impl Matcher<'_, '_> {
         state: &mut MachineState,
     ) -> Result<u32, MatchError> {
         for index in 0..=u16::MAX {
-            let child = match node.index_children.index().binary_search(&index) {
-                Ok(found) => Some(node.index_children.child()[found]),
-                Err(_) => node.any_index_child,
-            };
+            let fixed = node
+                .index_children
+                .index()
+                .binary_search(&index)
+                .ok()
+                .map(|found| node.index_children.child()[found]);
+            if node.has_exhaustive {
+                self.flag_uncovered(node, fixed, state);
+            }
+            let child = fixed.or(node.any_index_child);
             pos = match child {
                 Some(child) => self.process_value(pos, child, state)?,
                 None => self.validate_value(pos, state)?,
@@ -717,6 +1009,10 @@ impl Matcher<'_, '_> {
         state: &mut MachineState,
         mut index: u32,
     ) -> Result<u32, MatchError> {
+        // Every element from here on is beyond any fixed-index coverage.
+        if node.has_exhaustive {
+            self.flag_uncovered(node, None, state);
+        }
         loop {
             let child = node.any_index_child;
             pos = match child {
@@ -963,8 +1259,20 @@ impl Matcher<'_, '_> {
         let first = self.bytes[range.start as usize];
         // Whether unescape_buf currently holds this value's unescaped content.
         let mut buf_ready = false;
-        for action in actions {
+        // A violated exhaustive container stays unsatisfied. Non-container
+        // values have no members, so they are trivially exhaustive (their walk
+        // never ran and the violation bits are stale, hence the container
+        // gate). Violation bits are only ever set for exhaustive actions, and
+        // exhaustive nodes always walk containers, so the bit alone decides —
+        // no action field load needed.
+        let check_exhaustive = node.has_exhaustive && matches!(first, b'{' | b'[');
+        for (offset, action) in actions.iter().enumerate() {
             if state.satisfied[action.field_bit as usize] {
+                continue;
+            }
+            if check_exhaustive
+                && state.exhaustive_violated[node.actions.start as usize + offset]
+            {
                 continue;
             }
             let type_ok = match &action.type_check {

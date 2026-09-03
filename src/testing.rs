@@ -295,43 +295,20 @@ pub fn test_fields() -> Vec<FieldPattern<'static>> {
     static A_C_D: [PathSegment; 3] = [key("a"), key("c"), key("d")];
     static LIST_0_NAME: [PathSegment; 3] = [key("list"), Index(0), key("name")];
     static LIST_ANY_ID: [PathSegment; 3] = [key("list"), AnyIndex, key("id")];
+    let plain = |path: &'static [PathSegment], r#type: FieldType| FieldPattern {
+        path,
+        r#type,
+        predicate: None,
+        capture: true,
+        exhaustive: false,
+    };
     vec![
-        FieldPattern {
-            path: &FOO,
-            r#type: FieldType::String,
-            predicate: None,
-            capture: true,
-        },
-        FieldPattern {
-            path: &A_B,
-            r#type: FieldType::Bool,
-            predicate: None,
-            capture: true,
-        },
-        FieldPattern {
-            path: &A_C,
-            r#type: FieldType::Object,
-            predicate: None,
-            capture: true,
-        },
-        FieldPattern {
-            path: &A_C_D,
-            r#type: FieldType::String,
-            predicate: None,
-            capture: true,
-        },
-        FieldPattern {
-            path: &LIST_0_NAME,
-            r#type: FieldType::String,
-            predicate: None,
-            capture: true,
-        },
-        FieldPattern {
-            path: &LIST_ANY_ID,
-            r#type: FieldType::Number,
-            predicate: None,
-            capture: true,
-        },
+        plain(&FOO, FieldType::String),
+        plain(&A_B, FieldType::Bool),
+        plain(&A_C, FieldType::Object),
+        plain(&A_C_D, FieldType::String),
+        plain(&LIST_0_NAME, FieldType::String),
+        plain(&LIST_ANY_ID, FieldType::Number),
     ]
 }
 
@@ -340,13 +317,17 @@ mod tests {
     use std::assert_matches;
 
     use crate::{
-        CaptureValue, DEFAULT_DEPTH_LIMIT, FieldPattern, FieldType, MachineState, MatchError,
-        MatchMachine, PathSegment, Pattern, UnescapedString, range_u32_to_usize,
+        CaptureValue, CompileError, DEFAULT_DEPTH_LIMIT, FieldPattern, FieldType, MachineState,
+        MatchError, MatchMachine, PathSegment, Pattern, UnescapedString, range_u32_to_usize,
         testing::{generate_test_json, test_fields},
     };
 
     /// Machine capture indices keyed by (set index, field index, predicate group name).
     type CaptureIndices = std::collections::HashMap<(u32, u32, Option<String>), u32>;
+
+    fn compile_err(sets: &[&[FieldPattern<'_>]]) -> CompileError {
+        MatchMachine::compile(sets.iter().map(|fields| Pattern { fields }), |_| {}).unwrap_err()
+    }
 
     fn compile(sets: &[&[FieldPattern<'_>]]) -> (MatchMachine, CaptureIndices) {
         let mut captures = std::collections::HashMap::new();
@@ -382,6 +363,15 @@ mod tests {
             r#type,
             predicate: predicate.map(|p| Regex::new(p).unwrap()),
             capture,
+            exhaustive: false,
+        }
+    }
+
+    /// `field` with `exhaustive: true`.
+    fn xfield(path: Vec<PathSegment>, r#type: FieldType, capture: bool) -> FieldPattern<'static> {
+        FieldPattern {
+            exhaustive: true,
+            ..field(path, r#type, None, capture)
         }
     }
 
@@ -1081,6 +1071,600 @@ mod tests {
             let json = generate_test_json(&fields, 0.0, 3.0, &mut rng);
             machine.match_string(&json, &mut state).unwrap();
             assert!(!state.result.did_match(0), "should not match: {json}");
+        }
+    }
+
+    // ---- exhaustive containers: matching behavior ----
+
+    #[test]
+    fn exhaustive_object() {
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(vec![key("cfg"), key("a")], FieldType::Number, None, false),
+            field(vec![key("cfg"), key("b")], FieldType::String, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"cfg":{"a":1,"b":"x"}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // Member order does not matter.
+        assert!(
+            run(&machine, r#"{"cfg":{"b":"x","a":1}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // An uncovered key leaves the exhaustive field unsatisfied.
+        assert!(
+            !run(&machine, r#"{"cfg":{"a":1,"b":"x","c":null}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_object_with_no_children_matches_only_empty() {
+        let fields = [xfield(vec![key("cfg")], FieldType::Object, false)];
+        let (machine, _) = compile(&[&fields]);
+        assert!(run(&machine, r#"{"cfg":{}}"#).unwrap().result.did_match(0));
+        assert!(
+            !run(&machine, r#"{"cfg":{"k":1}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_object_deep_coverage() {
+        // "a" is covered because a same-set field path passes through it, even
+        // though no field names "a" itself; sibling keys deeper down are only
+        // constrained by their own (non-exhaustive) containers.
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(
+                vec![key("cfg"), key("a"), key("b")],
+                FieldType::Number,
+                None,
+                false,
+            ),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"cfg":{"a":{"b":1}}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            run(&machine, r#"{"cfg":{"a":{"b":1,"z":9}}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            !run(&machine, r#"{"cfg":{"a":{"b":1},"z":9}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_array() {
+        let fields = [
+            xfield(vec![key("arr")], FieldType::Array, false),
+            field(vec![key("arr"), Index(0)], FieldType::Number, None, false),
+            field(vec![key("arr"), Index(1)], FieldType::String, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"arr":[1,"x"]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // An element beyond the covered indices violates exhaustiveness.
+        assert!(
+            !run(&machine, r#"{"arr":[1,"x",true]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // Shorter arrays leave the fixed-index fields unsatisfied instead.
+        assert!(!run(&machine, r#"{"arr":[1]}"#).unwrap().result.did_match(0));
+        assert!(!run(&machine, r#"{"arr":[]}"#).unwrap().result.did_match(0));
+    }
+
+    #[test]
+    fn exhaustive_array_hole_never_matches_past_it() {
+        // Covered indices {0, 2} with nothing at 1: any array long enough to
+        // reach index 2 necessarily contains uncovered index 1.
+        let fields = [
+            xfield(vec![key("arr")], FieldType::Array, false),
+            field(vec![key("arr"), Index(0)], FieldType::Number, None, false),
+            field(vec![key("arr"), Index(2)], FieldType::Number, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            !run(&machine, r#"{"arr":[1,2,3]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(!run(&machine, r#"{"arr":[1]}"#).unwrap().result.did_match(0));
+    }
+
+    #[test]
+    fn exhaustive_any_trivial_for_non_containers() {
+        let fields = [xfield(vec![key("v")], FieldType::Any, false)];
+        let (machine, _) = compile(&[&fields]);
+        for good in [
+            r#"{"v":5}"#,
+            r#"{"v":"s"}"#,
+            r#"{"v":true}"#,
+            r#"{"v":null}"#,
+            r#"{"v":{}}"#,
+            r#"{"v":[]}"#,
+        ] {
+            assert!(run(&machine, good).unwrap().result.did_match(0), "{good}");
+        }
+        for bad in [r#"{"v":{"k":1}}"#, r#"{"v":[1]}"#] {
+            assert!(!run(&machine, bad).unwrap().result.did_match(0), "{bad}");
+        }
+    }
+
+    #[test]
+    fn exhaustive_root() {
+        let fields = [
+            xfield(vec![], FieldType::Object, false),
+            field(vec![key("a")], FieldType::Number, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(run(&machine, r#"{"a":1}"#).unwrap().result.did_match(0));
+        assert!(
+            !run(&machine, r#"{"a":1,"b":2}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_under_any_index_resets_per_element() {
+        // The first element violates exhaustiveness; the second satisfies it,
+        // so the violation must not leak between elements.
+        let fields = [
+            xfield(vec![key("list"), AnyIndex], FieldType::Object, false),
+            field(
+                vec![key("list"), AnyIndex, key("id")],
+                FieldType::Number,
+                None,
+                false,
+            ),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"list":[{"id":1,"extra":2},{"id":3}]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            !run(&machine, r#"{"list":[{"id":1,"extra":2}]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_coverage_is_per_set() {
+        // Set 1's cfg.b does not cover "b" for set 0's exhaustive cfg.
+        let set0 = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(vec![key("cfg"), key("a")], FieldType::Number, None, false),
+        ];
+        let set1 = [field(
+            vec![key("cfg"), key("b")],
+            FieldType::Number,
+            None,
+            false,
+        )];
+        let (machine, _) = compile(&[&set0, &set1]);
+        let state = run(&machine, r#"{"cfg":{"a":1,"b":2}}"#).unwrap();
+        assert!(!state.result.did_match(0));
+        assert!(state.result.did_match(1));
+        let state = run(&machine, r#"{"cfg":{"a":1}}"#).unwrap();
+        assert!(state.result.did_match(0));
+        assert!(!state.result.did_match(1));
+    }
+
+    #[test]
+    fn exhaustive_cross_set_any_index_never_covers() {
+        // Another set's AnyIndex may walk an element, but it does not cover
+        // the index for this set's exhaustive array.
+        let set0 = [
+            xfield(vec![key("arr")], FieldType::Array, false),
+            field(vec![key("arr"), Index(0)], FieldType::Any, None, false),
+        ];
+        let set1 = [field(vec![key("arr"), AnyIndex], FieldType::String, None, false)];
+        let (machine, _) = compile(&[&set0, &set1]);
+        let state = run(&machine, r#"{"arr":["x"]}"#).unwrap();
+        assert!(state.result.did_match(0));
+        assert!(state.result.did_match(1));
+        let state = run(&machine, r#"{"arr":["x","y"]}"#).unwrap();
+        assert!(!state.result.did_match(0));
+        assert!(state.result.did_match(1));
+    }
+
+    #[test]
+    fn exhaustive_capture_gated_by_violation() {
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, true),
+            field(vec![key("cfg"), key("a")], FieldType::Number, None, false),
+        ];
+        let (machine, captures) = compile(&[&fields]);
+        let input = r#"{"cfg":{"a":1}}"#;
+        let state = run(&machine, input).unwrap();
+        assert!(state.result.did_match(0));
+        match state.result.capture(captures[&(0, 0, None)]) {
+            Some(CaptureValue::Object(range)) => {
+                assert_eq!(&input[range_u32_to_usize(*range)], r#"{"a":1}"#)
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+        // A violated exhaustive container is skipped entirely: no capture.
+        let state = run(&machine, r#"{"cfg":{"a":1,"b":2}}"#).unwrap();
+        assert!(!state.result.did_match(0));
+        assert_matches!(state.result.capture(captures[&(0, 0, None)]), None);
+    }
+
+    #[test]
+    fn exhaustive_duplicate_members() {
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(vec![key("cfg"), key("a")], FieldType::Number, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        // Duplicate covered keys are each covered.
+        assert!(
+            run(&machine, r#"{"cfg":{"a":1,"a":2}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // A later duplicate of the container can satisfy the field after an
+        // earlier violating instance, matching first-satisfying semantics.
+        assert!(
+            run(&machine, r#"{"cfg":{"z":1},"cfg":{"a":1}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_wrong_container_kind_unsatisfied() {
+        let obj = [xfield(vec![key("cfg")], FieldType::Object, false)];
+        let (machine, _) = compile(&[&obj]);
+        assert!(!run(&machine, r#"{"cfg":[]}"#).unwrap().result.did_match(0));
+        assert!(!run(&machine, r#"{"cfg":1}"#).unwrap().result.did_match(0));
+        let arr = [xfield(vec![key("cfg")], FieldType::Array, false)];
+        let (machine, _) = compile(&[&arr]);
+        assert!(!run(&machine, r#"{"cfg":{}}"#).unwrap().result.did_match(0));
+    }
+
+    #[test]
+    fn exhaustive_tolerates_whitespace() {
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(vec![key("cfg"), key("a")], FieldType::Number, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, "{ \"cfg\" : {\n\t\"a\" : 1\r\n} }")
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_escaped_key_coverage() {
+        // The escaped spelling of a covered key still counts as covered.
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(vec![key("cfg"), key("A")], FieldType::Number, None, false),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"cfg":{"A":1}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_at_fixed_index_with_merged_wildcard() {
+        // a[*].x's subtree is merged into a[0]'s node at compile time; the
+        // merged same-set actions must count as coverage for a[0]'s
+        // exhaustive check.
+        let fields = [
+            xfield(vec![key("a"), Index(0)], FieldType::Object, false),
+            field(
+                vec![key("a"), AnyIndex, key("x")],
+                FieldType::Number,
+                None,
+                false,
+            ),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"a":[{"x":1}]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            run(&machine, r#"{"a":[{"x":1},{"y":5}]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            !run(&machine, r#"{"a":[{"x":1,"z":2}]}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    #[test]
+    fn exhaustive_nested() {
+        let fields = [
+            xfield(vec![key("outer")], FieldType::Object, false),
+            xfield(vec![key("outer"), key("inner")], FieldType::Object, false),
+            field(
+                vec![key("outer"), key("inner"), key("a")],
+                FieldType::Number,
+                None,
+                false,
+            ),
+        ];
+        let (machine, _) = compile(&[&fields]);
+        assert!(
+            run(&machine, r#"{"outer":{"inner":{"a":1}}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        // Violation at either level breaks the set.
+        assert!(
+            !run(&machine, r#"{"outer":{"inner":{"a":1},"z":2}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+        assert!(
+            !run(&machine, r#"{"outer":{"inner":{"a":1,"z":2}}}"#)
+                .unwrap()
+                .result
+                .did_match(0)
+        );
+    }
+
+    // ---- pattern validation ----
+
+    #[test]
+    fn validate_literal_json() {
+        for good in [
+            "[1,2,3]",
+            r#"{"a":1}"#,
+            r#""s""#,
+            "null",
+            "-0.5e2",
+            "[1, 2]",
+        ] {
+            let fields = [field(vec![key("l")], FieldType::Literal(good.into()), None, false)];
+            assert!(
+                MatchMachine::compile([Pattern { fields: &fields }].into_iter(), |_| {}).is_ok(),
+                "should compile: {good}"
+            );
+        }
+        for bad in ["nope", "01", "1 2", " 1", "1 ", "1.", "", "tru", r#"{"a":}"#] {
+            let fields = [field(vec![key("l")], FieldType::Literal(bad.into()), None, false)];
+            assert_matches!(
+                compile_err(&[&fields]),
+                CompileError::InvalidLiteral {
+                    set_index: 0,
+                    field_index: 0
+                },
+                "should be invalid: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_container_type_mismatch() {
+        let cases: Vec<[FieldPattern<'static>; 2]> = vec![
+            [
+                field(vec![key("foo")], FieldType::Object, None, false),
+                field(vec![key("foo"), Index(0)], FieldType::Any, None, false),
+            ],
+            [
+                field(vec![key("foo")], FieldType::Array, None, false),
+                field(vec![key("foo"), key("k")], FieldType::Any, None, false),
+            ],
+            [
+                field(vec![key("foo")], FieldType::Number, None, false),
+                field(vec![key("foo"), key("baz")], FieldType::Any, None, false),
+            ],
+            [
+                field(vec![key("foo")], FieldType::Literal("{}".into()), None, false),
+                field(vec![key("foo"), key("k")], FieldType::Any, None, false),
+            ],
+        ];
+        for fields in &cases {
+            assert_matches!(
+                compile_err(&[fields]),
+                CompileError::ContainerTypeMismatch {
+                    set_index: 0,
+                    container_field_index: 0,
+                    field_index: 1
+                }
+            );
+        }
+        // Field order does not matter.
+        let swapped = [
+            field(vec![key("foo"), Index(0)], FieldType::Any, None, false),
+            field(vec![key("foo")], FieldType::Object, None, false),
+        ];
+        assert_matches!(
+            compile_err(&[&swapped]),
+            CompileError::ContainerTypeMismatch {
+                set_index: 0,
+                container_field_index: 1,
+                field_index: 0
+            }
+        );
+        // Compatible combinations compile.
+        let good = [
+            field(vec![key("o")], FieldType::Object, None, false),
+            field(vec![key("o"), key("k")], FieldType::Any, None, false),
+            field(vec![key("a")], FieldType::Array, None, false),
+            field(vec![key("a"), Index(0)], FieldType::Any, None, false),
+            field(vec![key("a"), AnyIndex], FieldType::Any, None, false),
+            field(vec![key("any")], FieldType::Any, None, false),
+            field(vec![key("any"), key("k")], FieldType::Any, None, false),
+        ];
+        assert!(MatchMachine::compile([Pattern { fields: &good }].into_iter(), |_| {}).is_ok());
+        // Different sets may disagree about a path's type.
+        let set0 = [field(vec![key("foo")], FieldType::Object, None, false)];
+        let set1 = [field(vec![key("foo"), Index(0)], FieldType::Any, None, false)];
+        assert!(
+            MatchMachine::compile(
+                [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
+                |_| {}
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_conflicting_container_kinds() {
+        // No declared type for "foo", but its two descents disagree.
+        let fields = [
+            field(vec![key("foo"), key("a")], FieldType::Any, None, false),
+            field(vec![key("foo"), Index(0)], FieldType::Any, None, false),
+        ];
+        assert_matches!(
+            compile_err(&[&fields]),
+            CompileError::ConflictingContainerKinds {
+                set_index: 0,
+                field_index_a: 0,
+                field_index_b: 1
+            }
+        );
+        // Deeper shared prefix.
+        let fields = [
+            field(vec![key("x"), key("y"), key("a")], FieldType::Any, None, false),
+            field(vec![key("x"), key("y"), AnyIndex], FieldType::Any, None, false),
+        ];
+        assert_matches!(
+            compile_err(&[&fields]),
+            CompileError::ConflictingContainerKinds { .. }
+        );
+        // Index and AnyIndex agree on the kind; sibling keys agree trivially.
+        let good = [
+            field(vec![key("a"), Index(0)], FieldType::Any, None, false),
+            field(vec![key("a"), AnyIndex], FieldType::Any, None, false),
+            field(vec![key("o"), key("x")], FieldType::Any, None, false),
+            field(vec![key("o"), key("y")], FieldType::Any, None, false),
+        ];
+        assert!(MatchMachine::compile([Pattern { fields: &good }].into_iter(), |_| {}).is_ok());
+    }
+
+    #[test]
+    fn validate_any_index_under_exhaustive() {
+        // Directly below the exhaustive array.
+        let fields = [
+            xfield(vec![key("arr")], FieldType::Array, false),
+            field(vec![key("arr"), AnyIndex], FieldType::Any, None, false),
+        ];
+        assert_matches!(
+            compile_err(&[&fields]),
+            CompileError::AnyIndexUnderExhaustive {
+                set_index: 0,
+                container_field_index: 0,
+                field_index: 1
+            }
+        );
+        // Anywhere deeper below the exhaustive container is also rejected.
+        let fields = [
+            xfield(vec![key("cfg")], FieldType::Object, false),
+            field(
+                vec![key("cfg"), key("list"), AnyIndex],
+                FieldType::Any,
+                None,
+                false,
+            ),
+        ];
+        assert_matches!(
+            compile_err(&[&fields]),
+            CompileError::AnyIndexUnderExhaustive { .. }
+        );
+        // AnyIndex inside the exhaustive field's own prefix is fine.
+        let good = [
+            xfield(vec![key("list"), AnyIndex], FieldType::Object, false),
+            field(
+                vec![key("list"), AnyIndex, key("id")],
+                FieldType::Number,
+                None,
+                false,
+            ),
+        ];
+        assert!(MatchMachine::compile([Pattern { fields: &good }].into_iter(), |_| {}).is_ok());
+        // Another set descending with AnyIndex is allowed (coverage is
+        // per-set; see exhaustive_cross_set_any_index_never_covers).
+        let set0 = [xfield(vec![key("arr")], FieldType::Array, false)];
+        let set1 = [field(vec![key("arr"), AnyIndex], FieldType::Any, None, false)];
+        assert!(
+            MatchMachine::compile(
+                [Pattern { fields: &set0 }, Pattern { fields: &set1 }].into_iter(),
+                |_| {}
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_exhaustive_unsupported_type() {
+        for ty in [
+            FieldType::String,
+            FieldType::Number,
+            FieldType::Bool,
+            FieldType::Null,
+            FieldType::Literal("1".into()),
+        ] {
+            let fields = [xfield(vec![key("v")], ty.clone(), false)];
+            assert_matches!(
+                compile_err(&[&fields]),
+                CompileError::ExhaustiveUnsupportedType {
+                    set_index: 0,
+                    field_index: 0
+                },
+                "should reject exhaustive {ty:?}"
+            );
+        }
+        for ty in [FieldType::Object, FieldType::Array, FieldType::Any] {
+            let fields = [xfield(vec![key("v")], ty, false)];
+            assert!(MatchMachine::compile([Pattern { fields: &fields }].into_iter(), |_| {}).is_ok());
         }
     }
 
